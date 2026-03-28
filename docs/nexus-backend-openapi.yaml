@@ -1,0 +1,296 @@
+openapi: "3.1.0"
+info:
+  title: Nexus Backend API
+  version: "1.0.0"
+  description: |
+    API contract between the Nexus CLI (aider fork) and the Nexus FastAPI backend.
+
+    The backend serves as a middleware that:
+    1. Authenticates via internal auth proxy (username/password in headers)
+    2. Routes LLM requests through Lumin8
+    3. Injects product-specific context (SKILLS.md, Confluence, code standards) into every request
+
+    **CRITICAL**: The backend MUST NOT overwrite the first system message in the messages array.
+    That message contains aider's SEARCH/REPLACE format rules. The backend MUST APPEND its
+    RAG context as additional messages AFTER the first system message.
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+
+paths:
+  /v1/chat/completions:
+    post:
+      summary: OpenAI-compatible chat completions (main LLM endpoint)
+      description: |
+        Standard OpenAI ChatCompletions endpoint with SSE streaming support.
+
+        **Headers**:
+        - `X-Internal-Auth-Token` / `X-Internal-Auth-Secret`: internal auth proxy auth
+        - `X-Nexus-Skill`: Active product context (e.g., "staking"). Backend uses this
+          to load the corresponding SKILLS.md and inject Confluence/code context.
+
+        **CRITICAL - Message Handling**:
+        The `messages` array will contain aider's system prompt as the FIRST message.
+        This system prompt includes SEARCH/REPLACE block format rules that the LLM MUST follow.
+
+        The backend MUST:
+        1. Preserve messages[0] (aider's system prompt with edit format rules) UNCHANGED
+        2. APPEND product context (SKILLS.md, Confluence chunks, code standards) as additional
+           system messages AFTER messages[0] but BEFORE user messages
+        3. Forward the augmented messages to the LLM via Lumin8
+        4. Ensure the LLM response uses SEARCH/REPLACE block format for file edits
+
+        **Streaming**: Must use standard OpenAI SSE format.
+      parameters:
+        - name: X-Internal-Auth-Token
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Internal-Auth-Secret
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Nexus-Skill
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Active product/skill context name (e.g., "staking", "payments")
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - model
+                - messages
+              properties:
+                model:
+                  type: string
+                  example: "nexus-agent"
+                  description: Will always be "nexus-agent" from the CLI
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                        enum: [system, user, assistant]
+                      content:
+                        type: string
+                  description: |
+                    Message array. First message is always the system prompt with
+                    SEARCH/REPLACE format rules. DO NOT MODIFY IT.
+                stream:
+                  type: boolean
+                  default: true
+                temperature:
+                  type: number
+                  default: 0
+            example:
+              model: "nexus-agent"
+              stream: true
+              temperature: 0
+              messages:
+                - role: "system"
+                  content: "Act as an expert software developer. Always use best practices... [SEARCH/REPLACE rules here - DO NOT MODIFY]"
+                - role: "user"
+                  content: "I have added these files to the chat: main.py\n\nFix the authentication bug in the login handler"
+      responses:
+        "200":
+          description: SSE stream of completion chunks
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Here"},"finish_reason":null}]}
+
+                data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" is"},"finish_reason":null}]}
+
+                data: [DONE]
+
+  /api/skills:
+    get:
+      summary: List all available product skills/contexts
+      description: |
+        Returns all available skills that the CLI can auto-detect or the user can select.
+        Each skill represents a product context (e.g., "staking", "payments") with associated
+        keywords for auto-matching against repository metadata.
+      parameters:
+        - name: X-Internal-Auth-Token
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Internal-Auth-Secret
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of available skills
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                      example: "staking"
+                    description:
+                      type: string
+                      example: "Staking product - validator management and delegation"
+                    keywords:
+                      type: array
+                      items:
+                        type: string
+                      example: ["stake", "validator", "delegation", "epoch"]
+              example:
+                - name: "staking"
+                  description: "Staking product - validator management and delegation"
+                  keywords: ["stake", "validator", "delegation", "epoch"]
+                - name: "payments"
+                  description: "Payments processing and settlement engine"
+                  keywords: ["payment", "settlement", "transaction", "ledger"]
+
+  /api/skills/{name}:
+    get:
+      summary: Get a specific skill's metadata and content
+      description: |
+        Returns a single skill's metadata. Used by the CLI to validate that a skill
+        exists when the user types @skillname to switch context mid-session.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "staking"
+        - name: X-Internal-Auth-Token
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Internal-Auth-Secret
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Skill found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  skill_content:
+                    type: string
+                    description: Full markdown content of the SKILLS.md file
+              example:
+                name: "staking"
+                description: "Staking product - validator management and delegation"
+                skill_content: "# Staking Product Skills\n\n## Architecture\n..."
+        "404":
+          description: Skill not found
+
+  /api/overflow/ingest:
+    post:
+      summary: Submit error/issue for AgentOverflow analysis
+      description: |
+        Receives an error description, git diff, and file context from the CLI's
+        /solve command. The backend can analyze this to provide debugging suggestions
+        or store it for team knowledge sharing.
+      parameters:
+        - name: X-Internal-Auth-Token
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Internal-Auth-Secret
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - description
+              properties:
+                description:
+                  type: string
+                  description: User's description of the error/issue
+                git_diff:
+                  type: string
+                  description: Output of `git diff --no-color` (unstaged changes)
+                files_in_context:
+                  type: array
+                  items:
+                    type: string
+                  description: Relative paths of files currently in the aider chat context
+            example:
+              description: "Authentication middleware returns 403 after token refresh"
+              git_diff: "diff --git a/auth.py b/auth.py\n..."
+              files_in_context: ["src/auth.py", "src/middleware.py"]
+      responses:
+        "200":
+          description: Analysis accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ingested"
+                  suggestion:
+                    type: string
+                    description: Optional immediate suggestion from the backend
+              example:
+                status: "ingested"
+                suggestion: "This looks like a token expiry race condition. Check the refresh_token middleware order."
+
+  /v1/models:
+    get:
+      summary: Health check and model listing
+      description: |
+        Returns available models. Used by the CLI at startup to verify the backend
+        is reachable before entering the interactive session.
+      responses:
+        "200":
+          description: Backend is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        object:
+                          type: string
+              example:
+                data:
+                  - id: "nexus-agent"
+                    object: "model"
