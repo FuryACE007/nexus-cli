@@ -241,9 +241,45 @@ async def overflow_ingest(request: Request):
     }
 
 
+def _mock_summarize_diff(description: str, diff: str) -> str:
+    """
+    Simulate what the real backend does: summarize a committed diff into a
+    human-readable resolution using the LLM.
+
+    In production this calls the LLM (via Lumin8) with a prompt like:
+        "An engineer was debugging: {description}
+         They committed the following changes: {diff}
+         In 1-2 sentences, explain what the fix was."
+
+    Here we just extract the changed files and line counts as a mock summary.
+    """
+    lines = diff.splitlines()
+    changed_files = [l[6:] for l in lines if l.startswith("+++ b/")]
+    added   = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+
+    if changed_files:
+        files_str = ", ".join(changed_files[:3])
+        if len(changed_files) > 3:
+            files_str += f" (+{len(changed_files)-3} more)"
+        return (
+            f"[Auto-summarized from diff] Changes to {files_str}: "
+            f"+{added} lines / -{removed} lines. "
+            f"Original issue: {description[:100]}"
+        )
+    return f"[Auto-summarized from diff] {added} lines added, {removed} removed. Original issue: {description[:100]}"
+
+
 @app.post("/api/overflow/resolve")
 async def overflow_resolve(request: Request):
-    """Record the confirmed resolution for a previously submitted AgentOverflow issue."""
+    """
+    Record the confirmed resolution for a previously submitted AgentOverflow issue.
+
+    Accepts either:
+    - committed_diff: git show HEAD output — backend summarizes via LLM (automatic path)
+    - resolution: explicit developer note (manual /solved <text> path)
+    If both are present, resolution takes precedence.
+    """
     global last_request
     body = await request.json()
     headers = dict(request.headers)
@@ -255,12 +291,16 @@ async def overflow_resolve(request: Request):
         "body": body,
     }
 
-    issue_id = body.get("issue_id", "")
-    resolution = body.get("resolution", "")
+    issue_id      = body.get("issue_id", "")
+    resolution    = body.get("resolution", "")      # explicit note from developer
+    committed_diff = body.get("committed_diff", "")  # raw diff from auto-path
 
     print(f"\n📨 Received POST /api/overflow/resolve")
     print(f"   issue_id: {issue_id}")
-    print(f"   Resolution: {resolution[:80]}")
+    if resolution:
+        print(f"   Resolution (explicit): {resolution[:80]}")
+    elif committed_diff:
+        print(f"   Committed diff received: {len(committed_diff)} chars — will summarize via LLM")
 
     if not issue_id or issue_id not in _overflow_issues:
         raise HTTPException(
@@ -268,16 +308,30 @@ async def overflow_resolve(request: Request):
             detail=f"Issue {issue_id!r} not found. It may have already been resolved or expired.",
         )
 
-    if not resolution:
-        raise HTTPException(status_code=422, detail="resolution field is required and cannot be empty.")
+    if not resolution and not committed_diff:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one of committed_diff or resolution must be provided.",
+        )
 
-    # Store the confirmed resolution
-    _overflow_issues[issue_id]["resolution"] = resolution
-    print(f"   ✅ Resolution stored — knowledge base now has {sum(1 for v in _overflow_issues.values() if v['resolution'])} resolved issue(s)")
+    # If the developer wrote an explicit note, use it directly.
+    # Otherwise, summarize the committed diff via LLM (mocked here).
+    if resolution:
+        final_resolution = resolution
+        source = "explicit note"
+    else:
+        issue_description = _overflow_issues[issue_id].get("description", "")
+        final_resolution = _mock_summarize_diff(issue_description, committed_diff)
+        source = "LLM summary of committed diff"
+
+    _overflow_issues[issue_id]["resolution"] = final_resolution
+    resolved_count = sum(1 for v in _overflow_issues.values() if v["resolution"])
+    print(f"   ✅ Resolution stored via {source}")
+    print(f"   Knowledge base: {resolved_count} resolved issue(s)")
 
     return {
         "status": "resolved",
-        "message": "Resolution recorded. This fix will be surfaced for similar future issues.",
+        "message": "Fix captured. The knowledge base will surface this for similar future issues.",
     }
 
 

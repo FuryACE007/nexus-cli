@@ -353,6 +353,12 @@ class Commands:
         commit_message = args.strip() if args else None
         self.coder.repo.commit(message=commit_message, coder=self.coder)
 
+        # ── AgentOverflow: auto-resolve on commit ─────────────────────────────
+        # If the developer ran /solve earlier this session, treat the act of
+        # committing as confirmation that the problem is solved. The commit
+        # message becomes the resolution — zero extra effort required.
+        self._nexus_maybe_auto_resolve()
+
     def cmd_lint(self, args="", fnames=None):
         "Lint and fix in-chat files or all dirty files if none in chat"
 
@@ -1691,6 +1697,112 @@ Just show me the edits I need to make.
         except Exception as e:
             self.io.tool_error(f"An unexpected error occurred while copying to clipboard: {str(e)}")
 
+    # ── AgentOverflow helpers ─────────────────────────────────────────────────
+
+    def _nexus_get_committed_diff(self):
+        """
+        Return the full diff of the most recent commit (git show HEAD).
+
+        This is the ground-truth signal for what actually fixed the problem —
+        far more reliable than the commit message, which developers often write
+        as "fix", "wip", or "changes".  The backend uses this diff plus the
+        original issue description to generate a meaningful resolution summary
+        via LLM, so the knowledge base entry is always human-readable even
+        though no human wrote it.
+
+        Capped at 8000 chars to keep the API payload reasonable.
+        """
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["git", "show", "HEAD", "--no-color", "-p", "--stat"],
+                capture_output=True, text=True, timeout=10,
+                cwd=self.coder.root if hasattr(self.coder, "root") else None,
+            )
+            diff = result.stdout.strip()
+            if not diff:
+                return None
+            if len(diff) > 8000:
+                diff = diff[:8000] + "\n\n... (diff truncated for payload size)"
+            return diff
+        except Exception:
+            return None
+
+    def _nexus_send_resolve(self, issue_id, committed_diff=None, resolution=None):
+        """
+        POST to /api/overflow/resolve.  Returns True on success.
+
+        Prefer sending committed_diff — the backend will use the LLM to
+        summarize it into a human-readable resolution and embed that in the
+        knowledge base.  resolution (plain text) is the fallback for when the
+        developer explicitly types /solved <explanation>.
+
+        Either committed_diff or resolution must be provided.
+        """
+        import requests
+        from aider.nexus_auth import NEXUS_BASE_URL
+
+        payload = {"issue_id": issue_id}
+        if committed_diff:
+            payload["committed_diff"] = committed_diff
+        if resolution:
+            payload["resolution"] = resolution
+
+        headers = {"Content-Type": "application/json"}
+        if hasattr(self.coder.main_model, "_nexus_extra_headers"):
+            headers.update(self.coder.main_model._nexus_extra_headers)
+        try:
+            resp = requests.post(
+                f"{NEXUS_BASE_URL}/api/overflow/resolve",
+                json=payload,
+                headers=headers,
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _nexus_maybe_auto_resolve(self):
+        """
+        Called automatically after every /commit.
+
+        If the developer ran /solve earlier in this session, the commit is
+        treated as confirmation that the problem is fixed.  We capture the
+        committed diff (what actually changed in code) and send it to the
+        backend.  The backend runs the diff + original issue through the LLM
+        to generate a concise, meaningful resolution summary — no input from
+        the developer needed at any point.
+
+        Why diff, not commit message?
+        Commit messages like "fix", "wip", or "changes" are useless for a
+        knowledge base.  The diff is objective: it shows exactly what lines
+        were added or removed to make the error go away.
+        """
+        issue_id = getattr(self.coder, "_nexus_last_issue_id", None)
+        if not issue_id:
+            return  # no pending /solve — nothing to do
+
+        committed_diff = self._nexus_get_committed_diff()
+        if not committed_diff:
+            # Can't read the diff — skip silently rather than interrupting flow
+            return
+
+        ok = self._nexus_send_resolve(
+            issue_id,
+            committed_diff=committed_diff,
+        )
+        if ok:
+            self.coder._nexus_last_issue_id = None
+            self.coder._nexus_last_issue_description = None
+            self.coder._nexus_last_solve_suggestion = None
+            self.io.tool_output(
+                "📚 AgentOverflow: fix captured. "
+                "The knowledge base will surface this for similar future issues."
+            )
+        # Failures are silent — never let a KB write block the developer's commit flow
+
+    # ── /solve command ────────────────────────────────────────────────────────
+
     def cmd_solve(self, args):
         """Submit an error/issue to the Nexus AgentOverflow API for analysis.
 
@@ -1700,8 +1812,10 @@ Just show me the edits I need to make.
         the AgentOverflow backend. The backend returns an immediate suggestion
         and stores the issue for team knowledge sharing.
 
-        After trying the suggestion, use /solved to record what actually fixed
-        it so future developers benefit from the confirmed resolution.
+        The issue is automatically marked as resolved the next time you /commit —
+        the commit message becomes the resolution. No extra steps needed.
+
+        If you want to add a more detailed explanation, use /solved before committing.
 
         Example:
             /solve auth middleware returning 403 after token refresh
@@ -1763,11 +1877,15 @@ Just show me the edits I need to make.
                 if suggestion:
                     self.io.tool_output(f"💡 Suggestion: {suggestion}")
 
-                # Store issue_id on the coder so /solved can reference it
+                # Store issue context on the coder object so the auto-resolve
+                # (triggered on /commit) and manual /solved both have what they need.
                 if issue_id:
                     self.coder._nexus_last_issue_id = issue_id
+                    self.coder._nexus_last_issue_description = error_description
+                    self.coder._nexus_last_solve_suggestion = suggestion
                     self.io.tool_output(
-                        f"   Run /solved \"<what fixed it>\" to record the confirmed resolution."
+                        "   Resolution will be recorded automatically when you /commit."
+                        " Or use /solved for a more detailed note."
                     )
             else:
                 self.io.tool_error(f"Overflow API returned HTTP {resp.status_code}")
@@ -1777,66 +1895,58 @@ Just show me the edits I need to make.
     def cmd_solved(self, args):
         """Record the confirmed resolution for the last submitted AgentOverflow issue.
 
-        Usage: /solved <what actually fixed it>
+        Usage: /solved [optional: what actually fixed it]
 
-        Closes the loop on the issue submitted via /solve by telling the backend
-        what resolution actually worked. The backend stores this as a confirmed
-        fix that will be surfaced to future developers who hit the same error.
+        With no arguments: uses the most recent git commit message as the resolution.
+        This means you can just type /solved after committing — no explanation needed.
 
-        This is intentionally separate from /solve because the LLM suggestion
-        may not always be correct — only the developer knows what truly fixed it.
+        With arguments: stores your custom description instead.
 
-        Example:
-            /solved moved the token refresh call before the expiry check in
-                    token_validator.py line 47 — race condition was the root cause
+        The resolution is also recorded automatically when you run /commit, so
+        calling /solved explicitly is only needed if you want to add a more
+        detailed note than your commit message provides.
+
+        Examples:
+            /solved                    ← uses last commit message automatically
+            /solved moved token refresh before expiry check on line 47
         """
-        import requests
-
-        from aider.nexus_auth import NEXUS_BASE_URL
-
-        resolution = args.strip() if args and args.strip() else ""
-
-        if not resolution:
-            self.io.tool_error("Usage: /solved <what actually fixed it>")
-            self.io.tool_error("Example: /solved moved token refresh before expiry check on line 47")
-            return
-
         # Retrieve the issue_id stored by the last /solve call
         issue_id = getattr(self.coder, "_nexus_last_issue_id", None)
         if not issue_id:
             self.io.tool_error(
-                "No pending issue found. Run /solve first to submit an issue, "
-                "then /solved to record its resolution."
+                "No pending issue found. Run /solve first to submit an issue."
             )
             return
 
-        payload = {
-            "issue_id": issue_id,
-            "resolution": resolution,
-        }
+        explicit_note = args.strip() if args and args.strip() else ""
 
-        headers = {"Content-Type": "application/json"}
-        if hasattr(self.coder.main_model, "_nexus_extra_headers"):
-            headers.update(self.coder.main_model._nexus_extra_headers)
-
-        try:
-            resp = requests.post(
-                f"{NEXUS_BASE_URL}/api/overflow/resolve",
-                json=payload,
-                headers=headers,
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                # Clear the stored issue_id — it's been resolved
-                self.coder._nexus_last_issue_id = None
-                self.io.tool_output(
-                    "✅ Resolution recorded. Future developers will see this fix "
-                    "automatically when they hit the same error."
+        if explicit_note:
+            # Developer wrote a description — use it directly (highest quality)
+            ok = self._nexus_send_resolve(issue_id, resolution=explicit_note)
+        else:
+            # No description — capture the committed diff and let the backend
+            # summarize it via LLM.  Much better than asking the developer to
+            # write something when they have nothing useful to add.
+            committed_diff = self._nexus_get_committed_diff()
+            if not committed_diff:
+                self.io.tool_error(
+                    "No committed changes found. Commit your fix first, then run /solved."
+                    " Or provide an explicit note: /solved <what fixed it>"
                 )
-            else:
-                self.io.tool_error(f"Resolve API returned HTTP {resp.status_code}")
-        except Exception as e:
-            self.io.tool_error(f"Failed to reach overflow API: {e}")
+                return
+            self.io.tool_output("   Capturing committed diff for knowledge base...")
+            ok = self._nexus_send_resolve(issue_id, committed_diff=committed_diff)
+
+        if ok:
+            self.coder._nexus_last_issue_id = None
+            self.coder._nexus_last_issue_description = None
+            self.coder._nexus_last_solve_suggestion = None
+            self.io.tool_output(
+                "✅ Fix captured. Future developers will see this resolution "
+                "automatically when they hit the same error."
+            )
+        else:
+            self.io.tool_error("Failed to reach overflow API. The issue_id is still stored — try again later.")
 
 
 def expand_subdir(file_path):

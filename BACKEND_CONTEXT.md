@@ -57,6 +57,23 @@
 
 ---
 
+## Complete CLI-Backend Interaction Flow
+
+See [`docs/nexus-agentic-flow-sequence.mermaid`](./docs/nexus-agentic-flow-sequence.mermaid) for a detailed Mermaid sequence diagram covering all CLI interactions:
+
+1. **Startup** — Skill detection, health check, skill metadata caching
+2. **@skill mid-session switch** — `GET /api/skills/{name}`, updates model headers, retrieves new SKILLS.md
+3. **Architect chat flow** — Plan generation with RAG context (SKILLS.md, Confluence, ChromaDB overflow)
+4. **Editor edit flow** — SEARCH/REPLACE block generation and file application
+5. **`/solve` command** — Issue ingest, similarity search, past fix suggestions
+6. **`/commit` auto-resolve** — Zero-effort path: captures git diff, backend LLM summarizes, ChromaDB upsert
+7. **`/solved` explicit note** — Optional override with developer-written explanation
+8. **Future developer** — Demonstrates how the next engineer gets instant surfaced fixes on similar issues
+
+The diagram shows all HTTP endpoints, request/response payloads, and how the vector DB and SQLite knowledge base stay in sync.
+
+---
+
 ## Request/Response Flow: Chat Completions
 
 ### Client (CLI) Sends:
@@ -381,31 +398,59 @@ endpoint to permanently attach the confirmed fix to this issue record.
 
 ### 5. POST /api/overflow/resolve
 
-**Purpose**: Attach a confirmed, developer-verified resolution to a previously ingested issue.
-This is the "close the loop" step — it's what actually builds the knowledge base.
+**Purpose**: Close the loop on a submitted issue by capturing what code actually changed.
+This is what populates the knowledge base — nothing is searchable until this is called.
+
+**Key design**: The CLI never asks the developer to write a description. Instead, it captures
+`git show HEAD` at commit time and sends the raw diff. **The backend summarizes it via LLM.**
+This means the KB always contains human-readable explanations even when commit messages say "fix".
 
 **Request Headers**: `X-Nexus-Skill` (optional)
 
-**Request Body**:
+**Request Body** — one of two shapes:
+
 ```json
+// Automatic path: commit-triggered, diff sent, backend summarizes
 {
   "issue_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "resolution": "The token refresh middleware was running after the auth check. Moving it earlier in the middleware stack fixed the 403s."
+  "committed_diff": "commit abc123\nAuthor: Dev <dev@co.com>\n\n    fix\n\ndiff --git a/auth/middleware.py ..."
+}
+
+// Manual path: developer explicitly typed /solved <note>
+{
+  "issue_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "resolution": "Moved TokenRefreshMiddleware to run before AuthMiddleware in the stack."
 }
 ```
+
+If both fields are present, `resolution` takes precedence (explicit > inferred).
+If neither is present, return 422.
+
+**Backend MUST**:
+1. Look up the issue by `issue_id` — return 404 if not found
+2. If `committed_diff` is present and `resolution` is absent — call the LLM with this prompt:
+   ```
+   An engineer was debugging this issue: {original_description}
+   They committed the following changes: {committed_diff}
+   In 1–2 sentences, explain what the fix was. Be specific about what changed and why it worked.
+   ```
+3. Store the final resolution text (LLM-generated or explicit) on the issue record
+4. Re-embed `"Issue: {description}\nResolution: {resolution}"` and upsert into the vector index
+5. Mark the issue as `resolved_at = now()`
 
 **Response** (200):
 ```json
 {
   "status": "resolved",
-  "message": "Resolution recorded. This fix will be surfaced for similar future issues."
+  "message": "Fix captured. The knowledge base will surface this for similar future issues."
 }
 ```
 
-**Response** (404): `issue_id` not found or already resolved.
+**Response** (404): `issue_id` not found.
+**Response** (422): Neither `committed_diff` nor `resolution` was provided.
 
-**Used By**: CLI `/solved` command. After this call succeeds, the CLI clears its locally
-stored `_nexus_last_issue_id` to prevent stale re-use.
+**Used By**: CLI auto-triggers on `/commit` (sends diff). CLI also triggers on manual `/solved`.
+After success, the CLI clears `_nexus_last_issue_id` to prevent stale re-use.
 
 ---
 
@@ -434,117 +479,287 @@ error gets an immediate, battle-tested fix — without needing to ask the LLM to
 
 ### Lifecycle of an Issue
 
+The key design principle: **developers provide zero extra input.** The resolution is
+captured automatically from the git diff at commit time, not from a text field the
+developer has to fill in. The backend uses the LLM to turn that diff into a meaningful
+summary, so the knowledge base always contains human-readable entries.
+
 ```
 Developer types:    /solve Auth returns 403 after token refresh
                               │
                               ▼
-CLI collects:       description + git diff + files_in_context
+CLI collects:       description + git diff (current state) + files_in_context
                               │
                               ▼
 POST /api/overflow/ingest ────► backend assigns issue_id
                               │   ├─ embeds description
-                              │   ├─ similarity search → top-K past resolutions
-                              │   ├─ returns issue_id + suggestion (may be empty)
-                              │   └─ stores pending issue in DB
+                              │   ├─ similarity search → top-K resolved issues
+                              │   ├─ returns issue_id + suggestion (empty if no match)
+                              │   └─ stores PENDING issue in DB (not searchable yet)
                               │
-                    CLI prints suggestion (or "No similar issues found")
-                    CLI stores issue_id on coder object
+                    CLI prints suggestion, stores issue_id internally
+                    Developer tries the fix (using suggestion or their own approach)
                               │
-                    Developer tries the fix (or figures out their own)
-                              │
-Developer types:    /solved Moving token refresh before auth check fixed it
+                    Developer types /commit  ← only thing they do
                               │
                               ▼
-POST /api/overflow/resolve ───► backend attaches resolution to issue_id
+CLI auto-captures:  git show HEAD  (the committed diff — what actually changed)
+                              │
+                              ▼
+POST /api/overflow/resolve ───► backend receives committed_diff
+                                  ├─ calls LLM: "explain this fix in 1-2 sentences"
+                                  │   given: original issue description + diff
+                                  ├─ stores LLM-generated resolution text
                                   ├─ re-embeds (description + resolution) together
-                                  ├─ updates vector index
-                                  └─ marks issue as resolved
+                                  ├─ upserts to vector index → NOW searchable
+                                  └─ marks issue as resolved_at = now()
+
+                    CLI prints one line: "📚 AgentOverflow: fix captured."
+                    Developer sees nothing else. Zero extra steps.
 ```
 
-### Database Schema (Suggested)
+**Why the diff, not the commit message?**
+Commit messages are almost never useful for a knowledge base — "fix", "wip", "changes",
+"pr feedback" are the most common values in any real codebase. The diff is objective and
+complete: it shows exactly which lines changed, in which files, to make the error stop.
+Combined with the original issue description, the LLM can always produce a meaningful
+1–2 sentence summary from a diff, even if the commit message is empty.
+
+### Storage: ChromaDB + Relational DB
+
+The backend already uses **ChromaDB** as its vector store. The AgentOverflow knowledge base
+maps directly onto this: ChromaDB handles the embeddings and similarity search; your existing
+SQLite database holds the raw records, diffs, and timestamps for
+structured queries.
+
+**Two-store pattern:**
+
+```
+SQLite DB                        ChromaDB collection
+─────────────────────────        ──────────────────────────────────
+overflow_issues table            "overflow_resolutions" collection
+  id, skill, description,          One document per RESOLVED issue
+  solve_diff, committed_diff,       document = "Issue: ...\nResolution: ..."
+  files, resolution,                metadata = {skill, issue_id, resolved_at}
+  created_at, resolved_at           id = issue_id (same UUID)
+```
+
+SQLite is the source of truth for all records (resolved and pending).
+ChromaDB contains **only resolved issues** — it is purely a search index.
+When you need to look up a raw diff or check when an issue was submitted,
+query SQLite. When you need "find me the 3 most similar past fixes", query ChromaDB.
+
+**Relational schema (SQLite):**
 
 ```sql
--- One row per submitted issue
-CREATE TABLE overflow_issues (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    skill       TEXT NOT NULL,                  -- X-Nexus-Skill at time of submission
-    description TEXT NOT NULL,                  -- User's /solve message
-    git_diff    TEXT,                           -- git diff HEAD output
-    files       TEXT[],                         -- files in aider context
-    resolution  TEXT,                           -- populated by /resolve; NULL = unresolved
-    embedding   VECTOR(1536),                   -- embed(description + resolution) once resolved
-                                                -- embed(description) alone while unresolved
-    created_at  TIMESTAMPTZ DEFAULT now(),
-    resolved_at TIMESTAMPTZ
+CREATE TABLE IF NOT EXISTS overflow_issues (
+    id              TEXT PRIMARY KEY,        -- UUID generated in Python: str(uuid.uuid4())
+    skill           TEXT NOT NULL,
+    description     TEXT NOT NULL,           -- developer's /solve message
+    solve_diff      TEXT,                    -- git diff at /solve time
+    committed_diff  TEXT,                    -- git show HEAD captured at /commit
+    files           TEXT,                    -- JSON-encoded list: json.dumps(files_list)
+    resolution      TEXT,                    -- LLM-generated or explicit text; NULL = pending
+    created_at      TEXT DEFAULT (datetime('now')),
+    resolved_at     TEXT                     -- NULL = pending (not in ChromaDB yet)
 );
-
--- Index for fast similarity search (pgvector)
-CREATE INDEX ON overflow_issues USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
 ```
 
-If you are not using pgvector, the same pattern works with Qdrant, Pinecone, or any
-vector store: store one vector per issue, include `skill` as a metadata filter field.
+SQLite notes vs Postgres:
+- No `UUID` type → use `TEXT`, generate with `str(uuid.uuid4())` in Python
+- No array type → store `files` as `json.dumps(list)`, read back with `json.loads()`
+- No `now()` → use `datetime('now')` in SQL or `datetime.utcnow().isoformat()` in Python
+- Placeholders are `?` (positional) or `:name` (named), not `$1`
+- Use `sqlite3` (stdlib) or `aiosqlite` for async access
 
-### Embedding Strategy
+**ChromaDB collection setup:**
 
-**At ingest time** (issue pending, no resolution yet):
 ```python
-embedding = embed(issue.description)
-# This lets us do similarity search immediately, even before the fix is known.
+import chromadb
+
+# Use PersistentClient in production so data survives restarts
+chroma_client = chromadb.PersistentClient(path="./chroma_data")
+
+# One collection for all AgentOverflow resolutions
+# cosine distance is best for semantic text similarity
+overflow_collection = chroma_client.get_or_create_collection(
+    name="overflow_resolutions",
+    metadata={"hnsw:space": "cosine"},
+)
 ```
 
-**At resolve time** (confirmed fix attached):
+ChromaDB handles its own embeddings internally (using its default embedding function,
+or you can plug in your own). If Lumin8 exposes an `/embeddings` endpoint, you can
+wire it in as a custom embedding function — otherwise the default (`all-MiniLM-L6-v2`)
+works well for code-related text.
+
+### Ingest Flow (POST /api/overflow/ingest)
+
+At ingest time, only SQLite is written to. The issue is not added to ChromaDB yet —
+it stays invisible to similarity search until it has a confirmed resolution.
+
 ```python
-# Re-embed with resolution included — this is what will be retrieved in future
-embedding = embed(f"{issue.description}\n\nResolution: {issue.resolution}")
-issue.resolved_at = now()
-vector_db.upsert(id=issue.id, vector=embedding, metadata={"skill": issue.skill, "resolved": True})
+import sqlite3, uuid, json
+from datetime import datetime
+
+# Open (or create) the SQLite database — one file, zero extra infrastructure
+db = sqlite3.connect("nexus_overflow.db", check_same_thread=False)
+db.row_factory = sqlite3.Row   # lets you access columns by name: row["description"]
+db.execute("""
+    CREATE TABLE IF NOT EXISTS overflow_issues (
+        id TEXT PRIMARY KEY, skill TEXT NOT NULL, description TEXT NOT NULL,
+        solve_diff TEXT, committed_diff TEXT, files TEXT,
+        resolution TEXT, created_at TEXT DEFAULT (datetime('now')), resolved_at TEXT
+    )
+""")
+db.commit()
+
+
+def handle_ingest(description: str, git_diff: str, files: list, skill: str) -> dict:
+    issue_id = str(uuid.uuid4())
+
+    # 1. Persist raw record in SQLite (pending — not in ChromaDB yet)
+    db.execute(
+        "INSERT INTO overflow_issues (id, skill, description, solve_diff, files) VALUES (?,?,?,?,?)",
+        (issue_id, skill, description, git_diff, json.dumps(files)),
+    )
+    db.commit()
+
+    # 2. Query ChromaDB for similar RESOLVED issues to surface an immediate suggestion
+    #    ChromaDB only contains resolved issues, so no extra filter is needed here
+    suggestions = search_overflow(query=description, skill=skill, limit=1)
+    suggestion_text = suggestions[0]["resolution"] if suggestions else ""
+
+    return {"status": "ingested", "issue_id": issue_id, "suggestion": suggestion_text}
 ```
 
-**Why combine description + resolution in the final embedding?** Because future queries
-come from new issue descriptions. You want semantic overlap between "token refresh causes 403"
-(new query) and "Auth returns 403 after refresh — fix: move middleware earlier" (stored record).
-The resolution text anchors the meaning more precisely than the description alone.
+### Resolve Flow (POST /api/overflow/resolve)
 
-### Retrieval at Chat Time
-
-Every `/v1/chat/completions` request can optionally inject past fixes into `messages[1]`.
-Only retrieve **resolved** issues (those with a non-null `resolution`).
+This is where the LLM earns its keep. The committed diff comes in, the LLM summarizes
+it, and only then does the record enter ChromaDB and become searchable.
 
 ```python
-def search_overflow(query: str, skill: str, limit: int = 3) -> list[dict]:
+async def generate_resolution_summary(description: str, committed_diff: str) -> str:
     """
-    Find the top-K most similar resolved AgentOverflow issues for the current query.
+    Use the LLM (via Lumin8) to turn a raw git diff into a human-readable fix summary.
+    This is why AgentOverflow works without asking developers to write anything —
+    the diff IS the evidence; the LLM just makes it readable.
+    """
+    prompt = f"""An engineer was debugging this issue:
+{description}
 
-    Args:
-        query: The user's message (e.g. "Fix the delegation bug in staking contract")
-        skill: Active product skill (for optional pre-filter)
-        limit: Max number of past fixes to inject
+They committed the following changes to fix it:
+{committed_diff[:4000]}
 
-    Returns:
-        List of {"description": str, "resolution": str} dicts, most similar first.
-        Returns [] if the vector DB is unavailable (graceful degradation).
+In 1-2 sentences, explain what the fix was. Be specific: name the files, functions,
+or lines that changed and explain why that resolved the issue.
+Do not restate the problem — only describe the solution."""
+
+    response = await lumin8_client.chat.completions.create(
+        model="nexus-agent",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        stream=False,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def handle_resolve(issue_id: str, committed_diff: str = None, resolution: str = None):
+    # Fetch the raw record from SQLite
+    row = db.execute(
+        "SELECT * FROM overflow_issues WHERE id = ?", (issue_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Issue {issue_id!r} not found.")
+    if not committed_diff and not resolution:
+        raise HTTPException(status_code=422, detail="Provide committed_diff or resolution.")
+
+    # Generate the human-readable resolution text
+    if resolution:
+        final_resolution = resolution          # explicit developer note — use verbatim
+    else:
+        # generate_resolution_summary is async (calls Lumin8); call with asyncio if needed
+        final_resolution = generate_resolution_summary(row["description"], committed_diff)
+
+    # Update SQLite — set resolution, committed_diff, and resolved_at timestamp
+    db.execute("""
+        UPDATE overflow_issues
+        SET resolution = ?, committed_diff = ?, resolved_at = datetime('now')
+        WHERE id = ?
+    """, (final_resolution, committed_diff, issue_id))
+    db.commit()
+
+    # Add to ChromaDB — NOW it becomes searchable
+    # The document text combines issue + resolution so future queries on either side match
+    doc_text = f"Issue: {row['description']}\nResolution: {final_resolution}"
+    overflow_collection.upsert(
+        ids=[issue_id],
+        documents=[doc_text],
+        metadatas=[{
+            "skill": row["skill"],
+            "description": row["description"],
+            "resolution": final_resolution,
+        }],
+    )
+```
+
+**Why `upsert` instead of `add`?** If `/solved` is called twice for the same issue (e.g.
+the developer refines their note), `upsert` replaces the existing document cleanly.
+
+**Why combine description + resolution as one document string?** ChromaDB embeds the
+`document` field. Future ingest queries come in as issue descriptions — e.g. "getting 403
+on auth endpoints". You want that query to hit the stored "Issue: token refresh causes 403 /
+Resolution: moved refresh middleware before auth check" record. Including both sides in
+the document shifts the embedding toward the solution space, not just the problem space,
+which dramatically improves retrieval quality.
+
+### Retrieval at Chat Time (and at Ingest)
+
+Used in two places: (1) at ingest to surface a suggestion immediately; (2) at every
+`/v1/chat/completions` request to inject past fixes into `messages[1]`.
+
+```python
+async def search_overflow(query: str, skill: str, limit: int = 3) -> list[dict]:
+    """
+    Query ChromaDB for the most similar resolved issues.
+    Only resolved issues exist in ChromaDB, so no extra filter needed.
+    The `skill` metadata filter scopes results to the same product context.
+    Returns [] if ChromaDB is unavailable — never blocks the LLM.
     """
     try:
-        query_vec = embed(query)
-        results = vector_db.search(
-            vector=query_vec,
-            filter={"skill": skill, "resolved": True},  # only confirmed fixes
-            top_k=limit,
-            min_score=0.82,   # tune this — too low = noise, too high = misses
+        results = overflow_collection.query(
+            query_texts=[query],
+            n_results=limit,
+            where={"skill": skill},          # filter to same product context
         )
+        # ChromaDB returns parallel lists — zip them up
+        docs      = results["documents"][0]   # list of document strings
+        metadatas = results["metadatas"][0]   # list of metadata dicts
+        distances = results["distances"][0]   # cosine distances (lower = more similar)
+
+        # Filter out weak matches (distance > 0.25 ≈ cosine similarity < 0.75)
+        # Tune this threshold based on your data — start at 0.25 and adjust
         return [
-            {"description": r.metadata["description"], "resolution": r.metadata["resolution"]}
-            for r in results
+            {
+                "description": meta["description"],
+                "resolution":  meta["resolution"],
+                "score": 1 - dist,            # convert distance to similarity for readability
+            }
+            for meta, dist in zip(metadatas, distances)
+            if dist < 0.25
         ]
     except Exception:
-        return []   # never let KB failures block the LLM
+        return []   # ChromaDB down → degrade gracefully, never block the LLM
 ```
 
-The results are injected into the RAG context block at `messages[1]`:
+**Threshold note**: ChromaDB with cosine distance returns values from 0 (identical) to 2
+(opposite). A distance of `0.25` corresponds to roughly 0.75 cosine similarity. Start there
+and tune — too low means noisy suggestions, too high means nothing is ever retrieved.
+
+The results are injected into the RAG context at `messages[1]`:
 
 ```python
+past_fixes = await search_overflow(query=messages[-1]["content"], skill=skill)
 if past_fixes:
     fixes_section = "\n\n".join(
         f"**Past issue**: {f['description']}\n**Confirmed fix**: {f['resolution']}"
@@ -553,27 +768,8 @@ if past_fixes:
     rag_context += f"\n\n### Confirmed Fixes from Developer Knowledge Base\n{fixes_section}"
 ```
 
-The LLM then sees real confirmed fixes from your team's own codebase alongside the SKILLS.md
-and Confluence context — giving it grounded, product-specific answers instead of generic advice.
-
-### Similarity Threshold Tuning
-
-The `min_score` of `0.82` (cosine similarity) is a starting point. Calibrate it by:
-
-1. Collecting 20–30 representative issue descriptions from developers
-2. Manually labelling which pairs are "same problem" vs "different problem"
-3. Finding the score that best separates the two classes
-
-A score too low causes noisy suggestions ("here's a database fix for your auth problem").
-A score too high causes missed retrievals and the system looks useless. `0.78–0.85` is a
-typical sweet spot for code-related issue embeddings.
-
-### Recommended Embedding Model
-
-Use the same embedding model the rest of the platform uses if one exists. Otherwise:
-- **`text-embedding-3-small`** (OpenAI) — 1536 dimensions, fast, cheap
-- **`text-embedding-ada-002`** — legacy but widely deployed
-- If using Lumin8 as the LLM router, check if it exposes an `/embeddings` endpoint
+The LLM sees real, team-verified fixes from your own codebase alongside SKILLS.md and
+Confluence — giving it grounded, product-specific answers instead of generic advice.
 
 ### What the CLI Does NOT Do
 
@@ -619,17 +815,22 @@ All embedding, search, and storage is the backend's responsibility.
 
 ### AgentOverflow Knowledge Base
 
+- [ ] Create `overflow_issues` table in SQLite (schema in KB Design section above)
+- [ ] Create ChromaDB `overflow_resolutions` collection with `{"hnsw:space": "cosine"}`
 - [ ] `POST /api/overflow/ingest`:
   - [ ] Accept `description`, `git_diff`, `files_in_context`
-  - [ ] Assign a UUID `issue_id` and persist the issue record
-  - [ ] Run similarity search against existing *resolved* issues (same skill preferred)
+  - [ ] Assign a UUID `issue_id` with `str(uuid.uuid4())`, persist as pending record in SQLite only
+  - [ ] Query ChromaDB `overflow_resolutions` with `where={"skill": skill}` for suggestions
   - [ ] Return `{ status, issue_id, suggestion }` — suggestion empty string if no match
 - [ ] `POST /api/overflow/resolve`:
-  - [ ] Look up `issue_id`; return 404 if not found
-  - [ ] Attach `resolution` text to the issue record
-  - [ ] Re-embed combined `(description + resolution)` and update the vector index
+  - [ ] Look up `issue_id` in SQLite; return 404 if not found
+  - [ ] If `resolution` present: use it directly
+  - [ ] If only `committed_diff` present: call LLM to summarize → use as `resolution`
+  - [ ] If neither: return 422
+  - [ ] Update SQLite: set `resolution`, `committed_diff`, `resolved_at = datetime('now')`
+  - [ ] `overflow_collection.upsert(id=issue_id, document="Issue: ...\nResolution: ...", metadata={skill, ...})`
   - [ ] Return `{ status: "resolved", message }`
-- [ ] At chat time (`/v1/chat/completions`), query overflow KB for past fixes and inject into `messages[1]`
+- [ ] At chat time (`/v1/chat/completions`), call `search_overflow()` and inject results into `messages[1]`
 
 ### Health Check
 
@@ -837,7 +1038,7 @@ Before implementation, confirm:
 1. **Lumin8 Integration**: How does Lumin8 provide streaming? (async generator? WebSocket? OpenAI-compatible SDK?)
 2. **Confluence**: Is Confluence available? What auth method and space key(s) should be searched?
 3. **Skills Storage**: Database? Filesystem? Config service? (Influences how SKILLS.md files are loaded per product)
-4. **Vector DB**: What embedding model and vector store are available? (pgvector in Postgres? Pinecone? Qdrant?)
+4. **Embedding model for ChromaDB**: ChromaDB defaults to `all-MiniLM-L6-v2`. If Lumin8 exposes an `/embeddings` endpoint, wire it in as a custom embedding function for consistency across the platform.
 5. **AgentOverflow Retention**: How long should unresolved issues be kept before expiry?
 6. **Error Logging**: Centralised logging service? (Datadog, Splunk, etc.) — needed for observability around AgentOverflow usage
 

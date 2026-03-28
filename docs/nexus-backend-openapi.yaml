@@ -255,19 +255,30 @@ paths:
     post:
       summary: Record the confirmed resolution for a previously submitted issue
       description: |
-        Called by the CLI's `/solved` command after the developer has found the actual fix.
+        Closes the loop on an issue created by `/api/overflow/ingest`. Called automatically
+        by the CLI when the developer commits while a `/solve` session is active.
 
-        **Flow**:
-        1. Developer encounters an error, runs `/solve <description>` — CLI calls `/api/overflow/ingest`
-        2. Backend returns `issue_id`; CLI stores it on the coder object
-        3. Developer tries the suggestion (or finds their own fix)
-        4. Developer runs `/solved <what actually fixed it>` — CLI calls `/api/overflow/resolve`
-        5. Backend stores the confirmed `(issue, resolution)` pair in the knowledge base
-        6. Future calls to `/api/overflow/ingest` with similar issues will retrieve this resolution
+        **Key design principle — no manual effort required**:
+        The CLI captures the committed git diff (`git show HEAD`) and sends it here.
+        The backend uses the LLM to summarize the diff in context of the original issue
+        description into a human-readable resolution. This means the knowledge base is
+        populated with meaningful content even when the developer's commit message is
+        just "fix" or "wip".
 
-        **Storage**: Backend should embed both the issue description and resolution text using
-        the same embedding model used for skill context, then store in the vector DB alongside
-        the skill name. Retrieval at ingest-time surfaces the top-K similar past resolutions.
+        **Two resolution sources (backend must handle both)**:
+
+        | Field | When present | Backend action |
+        |-------|-------------|---------------|
+        | `committed_diff` | Automatic path (commit-triggered) | Feed diff + original issue to LLM → generate summary → embed + store |
+        | `resolution` | Manual path (`/solved <note>`) | Use text directly → embed + store |
+
+        If both are present, prefer `resolution` (the developer wrote something explicit).
+        If only `committed_diff` is present, the backend MUST summarize it via LLM.
+
+        **Storage**: After generating/receiving the resolution text, embed
+        `"Issue: {description}\nResolution: {resolution}"` and upsert into the vector DB.
+        Mark the issue as resolved. Future `/api/overflow/ingest` calls with similar issues
+        will retrieve this record in their similarity search.
       parameters:
         - name: X-Nexus-Skill
           in: header
@@ -283,24 +294,30 @@ paths:
               type: object
               required:
                 - issue_id
-                - resolution
               properties:
                 issue_id:
                   type: string
                   format: uuid
                   description: The issue_id returned by /api/overflow/ingest
+                committed_diff:
+                  type: string
+                  description: |
+                    Output of `git show HEAD --no-color -p --stat` captured by the CLI
+                    at commit time. Capped at 8000 chars. Backend must summarize this
+                    via LLM to produce the resolution text for the knowledge base.
+                    Present on the automatic (commit-triggered) path.
                 resolution:
                   type: string
                   description: |
-                    Developer-written explanation of what actually fixed the issue.
-                    Should be a plain-language description — no code required, but code
-                    snippets are welcome and will be indexed.
+                    Explicit developer-written explanation. If present, skip LLM
+                    summarization and store this text directly. Present when the
+                    developer uses `/solved <explanation>` manually.
             example:
               issue_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-              resolution: "The token refresh middleware was running after the auth check. Moving it to run before the auth middleware in the middleware stack fixed the 403s."
+              committed_diff: "commit abc123\nAuthor: Dev <dev@co.com>\n\n    fix\n\ndiff --git a/auth/middleware.py b/auth/middleware.py\n--- a/auth/middleware.py\n+++ b/auth/middleware.py\n@@ -23,6 +23,7 @@ def build_middleware_stack():\n+    app.add_middleware(TokenRefreshMiddleware)\n     app.add_middleware(AuthMiddleware)\n"
       responses:
         "200":
-          description: Resolution recorded successfully
+          description: Resolution captured and queued for LLM summarization
           content:
             application/json:
               schema:
@@ -314,7 +331,7 @@ paths:
                     description: Human-readable confirmation
               example:
                 status: "resolved"
-                message: "Resolution recorded. This fix will be surfaced for similar future issues."
+                message: "Fix captured. The knowledge base will surface this for similar future issues."
         "404":
           description: issue_id not found
           content:
@@ -326,6 +343,17 @@ paths:
                     type: string
               example:
                 detail: "Issue a1b2c3d4-... not found. It may have already been resolved or expired."
+        "422":
+          description: Neither committed_diff nor resolution provided
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+              example:
+                detail: "At least one of committed_diff or resolution must be provided."
 
   /v1/models:
     get:
