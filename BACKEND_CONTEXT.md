@@ -19,8 +19,7 @@
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  1. Authentication Layer                                     │
-│     ├─ X-Internal-Auth-Token/Password headers → internal auth proxy     │
-│     └─ Session token cache (optional optimization)         │
+│     └─ Backend service account (no credentials from CLI)   │
 │                                                              │
 │  2. LLM Request Handler (/v1/chat/completions)              │
 │     ├─ Read X-Nexus-Skill header (active product)          │
@@ -68,8 +67,6 @@
 POST /v1/chat/completions HTTP/1.1
 Host: localhost:8000
 Content-Type: application/json
-X-Internal-Auth-Token: john_doe
-X-Internal-Auth-Secret: secure_pass_123
 X-Nexus-Skill: staking
 
 {
@@ -96,18 +93,8 @@ X-Nexus-Skill: staking
 async def chat_completions(request: Request):
     body = await request.json()
     skill = request.headers.get("X-Nexus-Skill", "default")
-    username = request.headers.get("X-Internal-Auth-Token")
-    password = request.headers.get("X-Internal-Auth-Secret")
 
-    # STEP 1: Authenticate via the internal auth proxy
-    try:
-        auth_result = await authenticate_with_torii(username, password)
-        if not auth_result.valid:
-            return JSONResponse({"error": "Auth failed"}, status_code=401)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=401)
-
-    # STEP 2: Extract and preserve aider's system prompt
+    # STEP 1: Extract and preserve aider's system prompt
     messages = body["messages"]
     aider_system_prompt = messages[0]  # DO NOT MODIFY
 
@@ -233,10 +220,10 @@ augmented = [
 **Purpose**: OpenAI-compatible LLM endpoint with RAG injection
 
 **Request Headers**:
-- `X-Internal-Auth-Token` (required): Proxy username
-- `X-Internal-Auth-Secret` (required): Proxy password
 - `X-Nexus-Skill` (required): Active product skill name
 - `Content-Type: application/json`
+
+**Authentication**: Backend authenticates via its own service account. No credentials required from CLI.
 
 **Request Body**:
 ```json
@@ -256,9 +243,8 @@ augmented = [
 - Terminator: `data: [DONE]\n\n`
 
 **Errors**:
-- 401: Auth failed
 - 400: Invalid request
-- 503: Lumin8/LLM service down
+- 503: LLM service down
 
 ---
 
@@ -267,8 +253,7 @@ augmented = [
 **Purpose**: List available product contexts
 
 **Request Headers**:
-- `X-Internal-Auth-Token` (optional but recommended)
-- `X-Internal-Auth-Secret` (optional but recommended)
+- `X-Nexus-Skill` (optional): Current product context (for consistent logs)
 
 **Response**:
 ```json
@@ -294,7 +279,7 @@ augmented = [
 
 **Purpose**: Validate skill exists + return full content (for @skill override)
 
-**Request Headers**: X-Internal-Auth-Token, X-Internal-Auth-Secret (optional)
+**Request Headers**: X-Nexus-Skill (optional): Current product context
 
 **Response** (200):
 ```json
@@ -317,7 +302,7 @@ augmented = [
 
 **Purpose**: Receive error/debugging submissions from `/solve` command
 
-**Request Headers**: X-Internal-Auth-Token, X-Internal-Auth-Secret (optional)
+**Request Headers**: X-Nexus-Skill (optional): Current product context
 
 **Request Body**:
 ```json
@@ -361,10 +346,10 @@ augmented = [
 
 ### Authentication
 
-- [ ] Validate `X-Internal-Auth-Token` and `X-Internal-Auth-Secret` against internal auth proxy
-- [ ] Return 401 if invalid
-- [ ] (Optional) Cache valid tokens to avoid repeated the internal auth proxy calls
-- [ ] (Optional) Add rate limiting per username
+- [ ] Backend authenticates via its own service account (not from CLI)
+- [ ] CLI sends NO auth headers (they're not required)
+- [ ] Extract `X-Nexus-Skill` header to determine product context
+- [ ] (Optional) Log X-Nexus-Skill for audit trails
 
 ### Skill Management
 
@@ -506,8 +491,6 @@ This runs a simplified backend that echoes requests and streams mock responses. 
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "X-Internal-Auth-Token: test" \
-  -H "X-Internal-Auth-Secret: test" \
   -H "X-Nexus-Skill: staking" \
   -H "Content-Type: application/json" \
   -d '{

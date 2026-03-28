@@ -42,8 +42,8 @@ Nexus FastAPI Backend  (NOT in this repo)
 ```
 nexus-cli/
 ├── aider/                          # Core — original aider package (DO NOT rename)
-│   ├── nexus_auth.py               # ← NEW: skill detection + config cache
-│   ├── main.py                     # ← MODIFIED: hardwired endpoint + auth wiring
+│   ├── nexus_auth.py               # ← NEW: skill detection + config cache (no credentials)
+│   ├── main.py                     # ← MODIFIED: hardwired endpoint + skill detection call
 │   ├── models.py                   # ← MODIFIED: validation bypass + header injection
 │   ├── commands.py                 # ← MODIFIED: /solve command added
 │   └── coders/
