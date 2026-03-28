@@ -1115,7 +1115,8 @@ class Commands:
             cmd_method = getattr(self, cmd_method_name, None)
             cmd = pad.format(cmd=cmd)
             if cmd_method:
-                description = cmd_method.__doc__
+                doc = cmd_method.__doc__ or ""
+                description = doc.strip().split("\n")[0]
                 self.io.tool_output(f"{cmd} {description}")
             else:
                 self.io.tool_output(f"{cmd} No description available.")
@@ -1804,7 +1805,7 @@ Just show me the edits I need to make.
     # ── /solve command ────────────────────────────────────────────────────────
 
     def cmd_solve(self, args):
-        """Submit an error/issue to the Nexus AgentOverflow API for analysis.
+        """Submit an issue to AgentOverflow for analysis and similar-fix suggestions.
 
         Usage: /solve <description of the error>
 
@@ -1893,7 +1894,7 @@ Just show me the edits I need to make.
             self.io.tool_error(f"Failed to reach overflow API: {e}")
 
     def cmd_solved(self, args):
-        """Record the confirmed resolution for the last submitted AgentOverflow issue.
+        """Confirm the last /solve issue is fixed; captures the committed diff automatically.
 
         Usage: /solved [optional: what actually fixed it]
 
