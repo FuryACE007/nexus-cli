@@ -858,6 +858,22 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
 
         main_model._nexus_extra_headers = nexus_headers
 
+        # Create architect model — same backend URL, different model name for routing
+        # Stage 1 of /architect uses this; backend routes "nexus-architect" to the architect agent
+        from aider import models as _aider_models
+        arch_model = _aider_models.Model(
+            "openai/nexus-architect",
+            editor_model=False,
+            weak_model=False,
+        )
+        arch_model._nexus_extra_headers = dict(nexus_headers)  # same skill, different model name
+        arch_model.editor_model = main_model       # stage 2 uses the code model
+        arch_model.editor_edit_format = "diff"     # code model edits with SEARCH/REPLACE
+
+        # Cross-references so cmd_architect / cmd_code can swap main_model at runtime
+        main_model._nexus_architect_model = arch_model
+        arch_model._nexus_code_model = main_model
+
         # Startup health check — verify backend is reachable
         try:
             import requests

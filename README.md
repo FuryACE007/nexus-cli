@@ -116,7 +116,7 @@ Nexus CLI has four chat modes. Switch between them mid-session:
 |------|---------|-------------|
 | **code** (default) | `/code` | Ask for code changes — produces edits |
 | **ask** | `/ask` | Ask questions without making any changes |
-| **architect** | `/architect` | High-level planning using two models |
+| **architect** | `/architect` | High-level planning via architect agent, then auto-applies edits |
 | **context** | `/context` | Explore surrounding code context |
 
 You can also inline a mode for a single message:
@@ -205,7 +205,7 @@ All commands start with `/`. Tab-completion is available.
 |---------|-------|-------------|
 | `/ask` | `/ask [question]` | Ask without editing files; or switch to ask mode |
 | `/code` | `/code [request]` | Request code changes; or switch to code mode |
-| `/architect` | `/architect [prompt]` | High-level design mode (2 models); or switch to architect mode |
+| `/architect` | `/architect [prompt]` | Plan changes via architect agent, then apply with code agent |
 | `/context` | `/context [prompt]` | Explore code context; or switch to context mode |
 | `/chat-mode` | `/chat-mode <mode>` | Explicitly switch mode (`ask`, `code`, `architect`, `context`) |
 | `/ok` | `/ok [addl text]` | Shortcut for "Ok, go ahead and make those changes" |

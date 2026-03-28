@@ -100,11 +100,64 @@ class TestMainModifications:
             ("http://localhost:8000/v1", "backend URL"),
             ("detect_active_skill", "skill detection function"),
             ("X-Nexus-Skill", "skill header injection"),
+            ("openai/nexus-architect", "architect model created at startup"),
+            ("_nexus_architect_model", "architect cross-reference stored on code model"),
+            ("_nexus_code_model", "code cross-reference stored on architect model"),
         ]
 
         for check_str, description in checks:
             assert check_str in content, f"Missing: {description}"
             print(f"  ✓ {description}")
+
+
+class TestArchitectWiring:
+    """Test architect mode two-model setup"""
+
+    def test_architect_model_in_main(self):
+        """Verify architect model is created and wired in main.py"""
+        with open(_test_dir / "aider" / "main.py") as f:
+            content = f.read()
+
+        print("\n✓ test_architect_model_in_main")
+        checks = [
+            ("openai/nexus-architect", "architect model name"),
+            ("arch_model.editor_model = main_model", "stage 2 wired to code model"),
+            ("_nexus_architect_model = arch_model", "cross-ref on code model"),
+            ("_nexus_code_model = main_model", "cross-ref on architect model"),
+        ]
+        for check_str, description in checks:
+            assert check_str in content, f"Missing: {description}"
+            print(f"  ✓ {description}")
+
+    def test_architect_validation_bypass(self):
+        """Verify nexus-architect bypasses litellm validation"""
+        with open(_test_dir / "aider" / "models.py") as f:
+            content = f.read()
+
+        print("\n✓ test_architect_validation_bypass")
+        assert "nexus-architect" in content
+        print("  ✓ nexus-architect in validation bypass")
+
+    def test_architect_cmd_swaps_model(self):
+        """Verify cmd_architect swaps main_model to architect model"""
+        with open(_test_dir / "aider" / "commands.py") as f:
+            content = f.read()
+
+        print("\n✓ test_architect_cmd_swaps_model")
+        assert "_nexus_architect_model" in content
+        assert "_restore_nexus_code_model" in content
+        assert "_nexus_code_model" in content
+        print("  ✓ model swap logic present in commands.py")
+
+    def test_skill_sync_to_both_models(self):
+        """Verify @skill tags update both code and architect model headers"""
+        with open(_test_dir / "aider" / "coders" / "base_coder.py") as f:
+            content = f.read()
+
+        print("\n✓ test_skill_sync_to_both_models")
+        assert "_nexus_architect_model" in content
+        assert "_nexus_code_model" in content
+        print("  ✓ X-Nexus-Skill synced to both model instances on @skill switch")
 
 
 class TestModelModifications:
@@ -116,9 +169,10 @@ class TestModelModifications:
             content = f.read()
 
         print("\n✓ test_nexus_validation_bypass")
-        assert 'if "nexus-agent" in self.name:' in content
+        assert "nexus-agent" in content
+        assert "nexus-architect" in content
         assert "return dict(keys_in_environment=" in content
-        print("  ✓ Short-circuit validation check in place")
+        print("  ✓ Short-circuit validation for nexus-agent and nexus-architect in place")
 
     def test_header_injection(self):
         """Verify header injection in send_completion"""

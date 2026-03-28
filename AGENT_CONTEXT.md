@@ -305,6 +305,41 @@ Config file at `~/.nexus/config` (mode 0o600):
 
 ---
 
+### 3.7 Architect Mode Wiring — Two Model Instances
+
+The `/architect` command uses a two-stage flow. Each stage routes to a **different backend agent** via the `model` field in the request body.
+
+**Stage 1 (plan)** → `openai/nexus-architect` → backend architect agent → returns a **natural language plan** (NO SEARCH/REPLACE)
+
+**Stage 2 (edit)** → `openai/nexus-agent` → backend code agent → returns **SEARCH/REPLACE blocks**
+
+At startup (`aider/main.py`, in the nexus block), two model instances are created:
+
+```python
+# main_model = code model (openai/nexus-agent) — already created
+main_model._nexus_extra_headers = nexus_headers
+
+# architect model — same backend URL, routes to architect agent via model name
+arch_model = models.Model("openai/nexus-architect", editor_model=False, weak_model=False)
+arch_model._nexus_extra_headers = dict(nexus_headers)
+arch_model.editor_model = main_model        # ArchitectCoder uses this for stage 2
+arch_model.editor_edit_format = "diff"
+
+# Cross-references for runtime mode switching in commands.py
+main_model._nexus_architect_model = arch_model
+arch_model._nexus_code_model = main_model
+```
+
+**Mode switching** (`aider/commands.py`):
+- `cmd_architect()` → sets `self.coder.main_model = arch_model` before entering architect mode
+- `cmd_code()`, `cmd_ask()`, `cmd_context()` → call `_restore_nexus_code_model()` which sets `self.coder.main_model = main_model`
+
+**`@skill` sync** (`aider/coders/base_coder.py`): When the user types `@payments`, both model instances have their `X-Nexus-Skill` header updated so whichever is active at the time of the next request sends the correct skill.
+
+**Validation bypass** (`aider/models.py`): Both `nexus-agent` and `nexus-architect` bypass litellm validation.
+
+---
+
 ## 4. Backend Contract (What the Backend Must Implement)
 
 The CLI expects a FastAPI server at `http://localhost:8000`. For production, change `NEXUS_BASE_URL` in `aider/nexus_auth.py` and the hardcoded URL in `aider/main.py`.
@@ -319,14 +354,23 @@ The CLI expects a FastAPI server at `http://localhost:8000`. For production, cha
 | `POST` | `/api/overflow/ingest` | Receive error traces for analysis |
 | `GET` | `/v1/models` | Health check (returns model list) |
 
-### 4.2 Headers on Every Request
+### 4.2 Headers and Model Name Routing
 
-The CLI sends only the skill header:
+The CLI sends only one header:
 ```
 X-Nexus-Skill: staking          (whichever skill is active)
 ```
 
-No auth headers are sent from the CLI. The backend authenticates via its own service account. The backend uses `X-Nexus-Skill` to load the right product context.
+No auth headers are sent from the CLI — the backend authenticates via its own service account.
+
+**The backend must also route based on the `model` field in the request body:**
+
+| `model` value | Backend routes to | Response format |
+|---------------|-------------------|----------------|
+| `nexus-agent` | Code agent | SEARCH/REPLACE blocks (required) |
+| `nexus-architect` | Architect agent | Natural language plan only (NO SEARCH/REPLACE) |
+
+⚠️ **Critical**: `nexus-architect` responses must NOT contain SEARCH/REPLACE blocks. The CLI feeds the plan text directly to `nexus-agent` as the next request for actual file editing.
 
 ### 4.3 `POST /v1/chat/completions` — THE CRITICAL ENDPOINT
 

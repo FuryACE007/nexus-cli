@@ -6,9 +6,13 @@ info:
     API contract between the Nexus CLI (aider fork) and the Nexus FastAPI backend.
 
     The backend serves as a middleware that:
-    1. Authenticates via internal auth proxy (username/password in headers)
-    2. Routes LLM requests through Lumin8
-    3. Injects product-specific context (SKILLS.md, Confluence, code standards) into every request
+    1. Routes LLM requests through the internal Lumin8 gateway
+    2. Injects product-specific context (SKILLS.md, Confluence, code standards) into every request
+    3. Stores and retrieves developer knowledge via the AgentOverflow system
+
+    Every CLI request carries an `X-Nexus-Skill` header identifying the active product context.
+    No username/password authentication is required — the service runs inside the internal network
+    and relies on a service-account token configured at deployment time (not sent by the CLI).
 
     **CRITICAL**: The backend MUST NOT overwrite the first system message in the messages array.
     That message contains aider's SEARCH/REPLACE format rules. The backend MUST APPEND its
@@ -26,7 +30,6 @@ paths:
         Standard OpenAI ChatCompletions endpoint with SSE streaming support.
 
         **Headers**:
-        - `X-Internal-Auth-Token` / `X-Internal-Auth-Secret`: internal auth proxy auth
         - `X-Nexus-Skill`: Active product context (e.g., "staking"). Backend uses this
           to load the corresponding SKILLS.md and inject Confluence/code context.
 
@@ -43,16 +46,6 @@ paths:
 
         **Streaming**: Must use standard OpenAI SSE format.
       parameters:
-        - name: X-Internal-Auth-Token
-          in: header
-          required: true
-          schema:
-            type: string
-        - name: X-Internal-Auth-Secret
-          in: header
-          required: true
-          schema:
-            type: string
         - name: X-Nexus-Skill
           in: header
           required: true
@@ -122,17 +115,6 @@ paths:
         Returns all available skills that the CLI can auto-detect or the user can select.
         Each skill represents a product context (e.g., "staking", "payments") with associated
         keywords for auto-matching against repository metadata.
-      parameters:
-        - name: X-Internal-Auth-Token
-          in: header
-          required: true
-          schema:
-            type: string
-        - name: X-Internal-Auth-Secret
-          in: header
-          required: true
-          schema:
-            type: string
       responses:
         "200":
           description: List of available skills
@@ -175,16 +157,6 @@ paths:
           schema:
             type: string
           example: "staking"
-        - name: X-Internal-Auth-Token
-          in: header
-          required: true
-          schema:
-            type: string
-        - name: X-Internal-Auth-Secret
-          in: header
-          required: true
-          schema:
-            type: string
       responses:
         "200":
           description: Skill found
@@ -214,17 +186,17 @@ paths:
         Receives an error description, git diff, and file context from the CLI's
         /solve command. The backend can analyze this to provide debugging suggestions
         or store it for team knowledge sharing.
+
+        The response includes an `issue_id` that the CLI stores locally. When the developer
+        finds the actual fix, they call `/solved <explanation>` which sends the `issue_id`
+        plus the confirmed resolution to `/api/overflow/resolve`.
       parameters:
-        - name: X-Internal-Auth-Token
+        - name: X-Nexus-Skill
           in: header
-          required: true
+          required: false
           schema:
             type: string
-        - name: X-Internal-Auth-Secret
-          in: header
-          required: true
-          schema:
-            type: string
+          description: Active product context, used to scope the knowledge base lookup
       requestBody:
         required: true
         content:
@@ -251,7 +223,84 @@ paths:
               files_in_context: ["src/auth.py", "src/middleware.py"]
       responses:
         "200":
-          description: Analysis accepted
+          description: Issue ingested and queued for analysis
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - issue_id
+                properties:
+                  status:
+                    type: string
+                    example: "ingested"
+                  issue_id:
+                    type: string
+                    format: uuid
+                    description: |
+                      Stable identifier for this issue record. The CLI stores this locally
+                      so the developer can call /solved later to attach a confirmed resolution.
+                  suggestion:
+                    type: string
+                    description: |
+                      Optional immediate suggestion surfaced by similarity search against past
+                      resolved issues. Empty string if no close match was found.
+              example:
+                status: "ingested"
+                issue_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                suggestion: "This looks like a token expiry race condition. Check the refresh_token middleware order."
+
+  /api/overflow/resolve:
+    post:
+      summary: Record the confirmed resolution for a previously submitted issue
+      description: |
+        Called by the CLI's `/solved` command after the developer has found the actual fix.
+
+        **Flow**:
+        1. Developer encounters an error, runs `/solve <description>` — CLI calls `/api/overflow/ingest`
+        2. Backend returns `issue_id`; CLI stores it on the coder object
+        3. Developer tries the suggestion (or finds their own fix)
+        4. Developer runs `/solved <what actually fixed it>` — CLI calls `/api/overflow/resolve`
+        5. Backend stores the confirmed `(issue, resolution)` pair in the knowledge base
+        6. Future calls to `/api/overflow/ingest` with similar issues will retrieve this resolution
+
+        **Storage**: Backend should embed both the issue description and resolution text using
+        the same embedding model used for skill context, then store in the vector DB alongside
+        the skill name. Retrieval at ingest-time surfaces the top-K similar past resolutions.
+      parameters:
+        - name: X-Nexus-Skill
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Product skill context (for scoping retrieval to the same product)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - issue_id
+                - resolution
+              properties:
+                issue_id:
+                  type: string
+                  format: uuid
+                  description: The issue_id returned by /api/overflow/ingest
+                resolution:
+                  type: string
+                  description: |
+                    Developer-written explanation of what actually fixed the issue.
+                    Should be a plain-language description — no code required, but code
+                    snippets are welcome and will be indexed.
+            example:
+              issue_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              resolution: "The token refresh middleware was running after the auth check. Moving it to run before the auth middleware in the middleware stack fixed the 403s."
+      responses:
+        "200":
+          description: Resolution recorded successfully
           content:
             application/json:
               schema:
@@ -259,13 +308,24 @@ paths:
                 properties:
                   status:
                     type: string
-                    example: "ingested"
-                  suggestion:
+                    example: "resolved"
+                  message:
                     type: string
-                    description: Optional immediate suggestion from the backend
+                    description: Human-readable confirmation
               example:
-                status: "ingested"
-                suggestion: "This looks like a token expiry race condition. Check the refresh_token middleware order."
+                status: "resolved"
+                message: "Resolution recorded. This fix will be surfaced for similar future issues."
+        "404":
+          description: issue_id not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+              example:
+                detail: "Issue a1b2c3d4-... not found. It may have already been resolved or expired."
 
   /v1/models:
     get:

@@ -937,6 +937,11 @@ class Coder:
                     # Update the skill header for all subsequent requests
                     if hasattr(self.main_model, "_nexus_extra_headers"):
                         self.main_model._nexus_extra_headers["X-Nexus-Skill"] = skill_name
+                    # Sync to the alternate nexus model (architect or code) so both stay in sync
+                    alt_model = getattr(self.main_model, "_nexus_architect_model", None) or \
+                                getattr(self.main_model, "_nexus_code_model", None)
+                    if alt_model and hasattr(alt_model, "_nexus_extra_headers"):
+                        alt_model._nexus_extra_headers["X-Nexus-Skill"] = skill_name
                     # Cache the selection for this repo
                     repo_root = getattr(self, "root", None)
                     if repo_root:

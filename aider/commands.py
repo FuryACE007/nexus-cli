@@ -1179,20 +1179,32 @@ class Commands:
     def completions_context(self):
         raise CommandCompletionException()
 
+    def _restore_nexus_code_model(self):
+        """If currently using the architect model, swap back to the code model."""
+        code_model = getattr(self.coder.main_model, "_nexus_code_model", None)
+        if code_model:
+            self.coder.main_model = code_model
+
     def cmd_ask(self, args):
         """Ask questions about the code base without editing any files. If no prompt provided, switches to ask mode."""  # noqa
+        self._restore_nexus_code_model()
         return self._generic_chat_command(args, "ask")
 
     def cmd_code(self, args):
         """Ask for changes to your code. If no prompt provided, switches to code mode."""  # noqa
+        self._restore_nexus_code_model()
         return self._generic_chat_command(args, self.coder.main_model.edit_format)
 
     def cmd_architect(self, args):
-        """Enter architect/editor mode using 2 different models. If no prompt provided, switches to architect/editor mode."""  # noqa
+        """Plan changes via the backend architect agent, then apply edits with the code agent."""  # noqa
+        arch_model = getattr(self.coder.main_model, "_nexus_architect_model", None)
+        if arch_model:
+            self.coder.main_model = arch_model
         return self._generic_chat_command(args, "architect")
 
     def cmd_context(self, args):
         """Enter context mode to see surrounding code context. If no prompt provided, switches to context mode."""  # noqa
+        self._restore_nexus_code_model()
         return self._generic_chat_command(args, "context", placeholder=args.strip() or None)
 
     def cmd_ok(self, args):
@@ -1680,7 +1692,20 @@ Just show me the edits I need to make.
             self.io.tool_error(f"An unexpected error occurred while copying to clipboard: {str(e)}")
 
     def cmd_solve(self, args):
-        """Submit an error/issue to the Nexus AgentOverflow API for analysis"""
+        """Submit an error/issue to the Nexus AgentOverflow API for analysis.
+
+        Usage: /solve <description of the error>
+
+        Sends the error description, current git diff, and files in context to
+        the AgentOverflow backend. The backend returns an immediate suggestion
+        and stores the issue for team knowledge sharing.
+
+        After trying the suggestion, use /solved to record what actually fixed
+        it so future developers benefit from the confirmed resolution.
+
+        Example:
+            /solve auth middleware returning 403 after token refresh
+        """
         import subprocess
 
         import requests
@@ -1717,7 +1742,7 @@ Just show me the edits I need to make.
             "files_in_context": files_in_context,
         }
 
-        # Get auth headers
+        # Get auth headers (includes X-Nexus-Skill)
         headers = {"Content-Type": "application/json"}
         if hasattr(self.coder.main_model, "_nexus_extra_headers"):
             headers.update(self.coder.main_model._nexus_extra_headers)
@@ -1731,12 +1756,85 @@ Just show me the edits I need to make.
             )
             if resp.status_code == 200:
                 result = resp.json()
-                self.io.tool_output("Overflow analysis submitted successfully.")
                 suggestion = result.get("suggestion", "")
+                issue_id = result.get("issue_id", "")
+
+                self.io.tool_output("✅ Submitted to AgentOverflow.")
                 if suggestion:
-                    self.io.tool_output(suggestion)
+                    self.io.tool_output(f"💡 Suggestion: {suggestion}")
+
+                # Store issue_id on the coder so /solved can reference it
+                if issue_id:
+                    self.coder._nexus_last_issue_id = issue_id
+                    self.io.tool_output(
+                        f"   Run /solved \"<what fixed it>\" to record the confirmed resolution."
+                    )
             else:
                 self.io.tool_error(f"Overflow API returned HTTP {resp.status_code}")
+        except Exception as e:
+            self.io.tool_error(f"Failed to reach overflow API: {e}")
+
+    def cmd_solved(self, args):
+        """Record the confirmed resolution for the last submitted AgentOverflow issue.
+
+        Usage: /solved <what actually fixed it>
+
+        Closes the loop on the issue submitted via /solve by telling the backend
+        what resolution actually worked. The backend stores this as a confirmed
+        fix that will be surfaced to future developers who hit the same error.
+
+        This is intentionally separate from /solve because the LLM suggestion
+        may not always be correct — only the developer knows what truly fixed it.
+
+        Example:
+            /solved moved the token refresh call before the expiry check in
+                    token_validator.py line 47 — race condition was the root cause
+        """
+        import requests
+
+        from aider.nexus_auth import NEXUS_BASE_URL
+
+        resolution = args.strip() if args and args.strip() else ""
+
+        if not resolution:
+            self.io.tool_error("Usage: /solved <what actually fixed it>")
+            self.io.tool_error("Example: /solved moved token refresh before expiry check on line 47")
+            return
+
+        # Retrieve the issue_id stored by the last /solve call
+        issue_id = getattr(self.coder, "_nexus_last_issue_id", None)
+        if not issue_id:
+            self.io.tool_error(
+                "No pending issue found. Run /solve first to submit an issue, "
+                "then /solved to record its resolution."
+            )
+            return
+
+        payload = {
+            "issue_id": issue_id,
+            "resolution": resolution,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if hasattr(self.coder.main_model, "_nexus_extra_headers"):
+            headers.update(self.coder.main_model._nexus_extra_headers)
+
+        try:
+            resp = requests.post(
+                f"{NEXUS_BASE_URL}/api/overflow/resolve",
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                # Clear the stored issue_id — it's been resolved
+                self.coder._nexus_last_issue_id = None
+                self.io.tool_output(
+                    "✅ Resolution recorded. Future developers will see this fix "
+                    "automatically when they hit the same error."
+                )
+            else:
+                self.io.tool_error(f"Resolve API returned HTTP {resp.status_code}")
         except Exception as e:
             self.io.tool_error(f"Failed to reach overflow API: {e}")
 

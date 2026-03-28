@@ -12,11 +12,16 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import json
 import asyncio
+import uuid
 
 app = FastAPI(title="Mock Nexus Backend", version="1.0.0")
 
 # Store last request for verification
 last_request = {}
+
+# In-memory store for AgentOverflow issues (mock — real backend uses a DB)
+# Maps issue_id → {"description": ..., "resolution": None | str, "skill": str}
+_overflow_issues: dict = {}
 
 
 @app.post("/v1/chat/completions")
@@ -52,8 +57,21 @@ async def chat_completions(request: Request):
                 print("   ✗ SEARCH/REPLACE prompt missing!")
 
     async def generate():
-        """Stream a mock response with SEARCH/REPLACE block"""
-        response_text = """Here's the fix:
+        """Stream a mock response — plan text for architect agent, SEARCH/REPLACE for code agent"""
+        model_name = body.get("model", "")
+        if "nexus-architect" in model_name:
+            # Architect agent returns a natural language plan — NO SEARCH/REPLACE blocks
+            response_text = """Here's the plan for this change:
+
+1. Locate the target function and identify its current signature
+2. Add input validation for None and negative values at the top of the function
+3. Raise a ValueError with a descriptive message for invalid inputs
+4. Keep all existing logic intact below the new validation block
+5. Update the docstring to document the new validation behaviour
+"""
+        else:
+            # Code agent returns SEARCH/REPLACE blocks for actual file edits
+            response_text = """Here's the fix:
 
 path/to/file.py
 ```python
@@ -191,9 +209,75 @@ async def overflow_ingest(request: Request):
     print(f"   Files in context: {len(body.get('files_in_context', []))}")
     print(f"   Skill: {headers.get('x-nexus-skill', 'not set')}")
 
+    # Assign a stable issue_id for this submission
+    issue_id = str(uuid.uuid4())
+    skill = headers.get("x-nexus-skill", "unknown")
+
+    # Store in mock knowledge base
+    _overflow_issues[issue_id] = {
+        "description": body.get("description", ""),
+        "git_diff": body.get("git_diff", ""),
+        "files_in_context": body.get("files_in_context", []),
+        "skill": skill,
+        "resolution": None,
+    }
+
+    print(f"   Assigned issue_id: {issue_id}")
+
+    # Mock: check if any resolved issues look similar (real backend uses vector search)
+    suggestion = ""
+    for past_id, past in _overflow_issues.items():
+        if past_id != issue_id and past["resolution"] and past["skill"] == skill:
+            suggestion = f"Similar past issue resolved with: {past['resolution']}"
+            break
+
+    if not suggestion:
+        suggestion = "This looks like an authentication timeout. Check your token refresh logic."
+
     return {
         "status": "ingested",
-        "suggestion": "This looks like an authentication timeout. Check your token refresh logic.",
+        "issue_id": issue_id,
+        "suggestion": suggestion,
+    }
+
+
+@app.post("/api/overflow/resolve")
+async def overflow_resolve(request: Request):
+    """Record the confirmed resolution for a previously submitted AgentOverflow issue."""
+    global last_request
+    body = await request.json()
+    headers = dict(request.headers)
+
+    last_request = {
+        "endpoint": "/api/overflow/resolve",
+        "method": "POST",
+        "headers": headers,
+        "body": body,
+    }
+
+    issue_id = body.get("issue_id", "")
+    resolution = body.get("resolution", "")
+
+    print(f"\n📨 Received POST /api/overflow/resolve")
+    print(f"   issue_id: {issue_id}")
+    print(f"   Resolution: {resolution[:80]}")
+
+    if not issue_id or issue_id not in _overflow_issues:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Issue {issue_id!r} not found. It may have already been resolved or expired.",
+        )
+
+    if not resolution:
+        raise HTTPException(status_code=422, detail="resolution field is required and cannot be empty.")
+
+    # Store the confirmed resolution
+    _overflow_issues[issue_id]["resolution"] = resolution
+    print(f"   ✅ Resolution stored — knowledge base now has {sum(1 for v in _overflow_issues.values() if v['resolution'])} resolved issue(s)")
+
+    return {
+        "status": "resolved",
+        "message": "Resolution recorded. This fix will be surfaced for similar future issues.",
     }
 
 
@@ -220,7 +304,14 @@ if __name__ == "__main__":
     import uvicorn
 
     print("🚀 Starting Mock Nexus Backend on http://localhost:8000")
-    print("📝 Test endpoints:")
+    print("📝 API endpoints:")
+    print("   POST /v1/chat/completions   - LLM completions (streaming)")
+    print("   GET  /v1/models             - Health check / model list")
+    print("   GET  /api/skills            - List product skill contexts")
+    print("   GET  /api/skills/{name}     - Get a skill's content")
+    print("   POST /api/overflow/ingest   - Submit an error for analysis")
+    print("   POST /api/overflow/resolve  - Record confirmed resolution")
+    print("📝 Debug endpoints:")
     print("   GET  /test/health           - Health check")
     print("   GET  /test/last-request     - See last request sent by CLI")
     print()

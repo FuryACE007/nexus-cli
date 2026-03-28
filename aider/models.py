@@ -726,8 +726,8 @@ class Model(ModelSettings):
             return dict(keys_in_environment=[var], missing_keys=[])
 
     def validate_environment(self):
-        # Nexus CLI: skip validation for nexus-agent model
-        if "nexus-agent" in self.name:
+        # Nexus CLI: skip validation for nexus models (both code and architect agents)
+        if "nexus-agent" in self.name or "nexus-architect" in self.name:
             return dict(keys_in_environment=["OPENAI_API_KEY"], missing_keys=[])
 
         res = self.fast_validate_environment()

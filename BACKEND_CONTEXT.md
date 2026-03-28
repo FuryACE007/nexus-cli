@@ -12,43 +12,41 @@
 │ Developer's Terminal: nexus command                         │
 └────────────────────────┬────────────────────────────────────┘
                          │
-                         │ HTTP/HTTPS + TLS
+                         │ HTTP  ·  X-Nexus-Skill header on every request
                          │
 ┌────────────────────────▼────────────────────────────────────┐
 │ Nexus FastAPI Backend (localhost:8000)                       │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  1. Authentication Layer                                     │
-│     └─ Backend service account (no credentials from CLI)   │
-│                                                              │
-│  2. LLM Request Handler (/v1/chat/completions)              │
+│  1. LLM Request Handler (/v1/chat/completions)              │
 │     ├─ Read X-Nexus-Skill header (active product)          │
 │     ├─ Load SKILLS.md for that product                      │
 │     ├─ Search Confluence for relevant chunks                │
-│     ├─ Append RAG context to messages[1]                    │
+│     ├─ Query AgentOverflow for similar past fixes          │
+│     ├─ Append all RAG context to messages[1]               │
 │     ├─ Forward augmented messages to LLM via Lumin8        │
 │     └─ Stream response back as SSE                          │
 │                                                              │
-│  3. Skill Management (/api/skills, /api/skills/{name})     │
+│  2. Skill Management (/api/skills, /api/skills/{name})     │
 │     ├─ Product metadata + keywords (for auto-detection)     │
 │     └─ Full SKILLS.md content (for context injection)       │
 │                                                              │
-│  4. Error Analysis (/api/overflow/ingest)                   │
-│     ├─ Receive error description + git diff + file list    │
-│     ├─ Store or immediately analyze                         │
-│     └─ Return optional debugging suggestion                 │
+│  3. AgentOverflow Knowledge Base                            │
+│     ├─ /api/overflow/ingest  — store issue + return id     │
+│     │   └─ similarity search → surface past resolutions    │
+│     └─ /api/overflow/resolve — attach confirmed fix to id  │
 │                                                              │
-└────────────────────────────────────────────────────────────┘
+└────────────────────────┬────────────────────────────────────┘
                          │
         ┌────────────────┼────────────────┐
         │                │                │
         ▼                ▼                ▼
-    ┌────────┐      ┌────────┐      ┌────────┐
-    │ the internal auth proxy  │      │ Lumin8 │      │ Conf-  │
-    │ Proxy  │      │ (LLM   │      │ luence │
-    │        │      │ Router)│      │ (Docs) │
-    └────────┘      └───┬────┘      └────────┘
-                        │
+   ┌─────────┐     ┌──────────┐     ┌──────────┐
+   │ Vector  │     │  Lumin8  │     │ Conf-    │
+   │   DB    │     │  (LLM    │     │ luence   │
+   │(issues +│     │  Router) │     │  (Docs)  │
+   │  fixes) │     └────┬─────┘     └──────────┘
+   └─────────┘          │
                         ▼
                   ┌─────────────┐
                   │  LLM Models │
@@ -98,6 +96,13 @@ async def chat_completions(request: Request):
     messages = body["messages"]
     aider_system_prompt = messages[0]  # DO NOT MODIFY
 
+    # STEP 2: Query AgentOverflow for similar past resolutions
+    past_fixes = search_overflow(
+        query=messages[-1]["content"],  # User's request
+        skill=skill,
+        limit=3
+    )
+
     # STEP 3: Build RAG context for the product
     try:
         skills_md = load_skills_md(skill)  # STAKING_SKILLS.md
@@ -111,6 +116,14 @@ async def chat_completions(request: Request):
         skills_md = confluence_chunks = code_standards = ""
 
     # STEP 4: Create RAG context message
+    past_fixes_section = ""
+    if past_fixes:
+        fixes_text = "\n\n".join(
+            f"**Past issue**: {f['description']}\n**Confirmed fix**: {f['resolution']}"
+            for f in past_fixes
+        )
+        past_fixes_section = f"\n\n### Confirmed Fixes from AgentOverflow\n{fixes_text}"
+
     rag_context = f"""## Nexus Product Context: {skill}
 
 ### Applicable Skills & Rules
@@ -120,7 +133,7 @@ async def chat_completions(request: Request):
 {confluence_chunks}
 
 ### Code Standards
-{code_standards}
+{code_standards}{past_fixes_section}
 
 ### Important
 You MUST format all code edits using SEARCH/REPLACE blocks as specified
@@ -213,11 +226,43 @@ augmented = [
 
 ---
 
+## Agent Routing via Model Name
+
+The CLI sends two different model names to the same backend URL. **The backend must route based on the `model` field in the request body:**
+
+| `model` value | Route to | Response format required |
+|---------------|----------|--------------------------|
+| `nexus-agent` | Code agent | SEARCH/REPLACE blocks — **mandatory** |
+| `nexus-architect` | Architect agent | Natural language plan only — **no SEARCH/REPLACE** |
+
+### How `/architect` works end-to-end
+
+```
+User: /architect add input validation to the validator
+
+Stage 1 — CLI sends:
+  POST /v1/chat/completions
+  {"model": "nexus-architect", "messages": [...]}
+
+  Backend: routes to architect agent → returns a natural language plan:
+  "Here's the plan: 1. Add None check at top of validate()..."
+
+Stage 2 — CLI automatically sends (after user confirms "Edit the files?"):
+  POST /v1/chat/completions
+  {"model": "nexus-agent", "messages": [...plan text as user message...]}
+
+  Backend: routes to code agent → returns SEARCH/REPLACE blocks → CLI applies file edits
+```
+
+⚠️ **Critical rule for `nexus-architect` responses**: Return a plain-text description of the changes. Do NOT include SEARCH/REPLACE blocks. The CLI treats the entire response as a plan and sends it to `nexus-agent` verbatim for the editing stage.
+
+---
+
 ## API Endpoint Specifications
 
 ### 1. POST /v1/chat/completions
 
-**Purpose**: OpenAI-compatible LLM endpoint with RAG injection
+**Purpose**: OpenAI-compatible LLM endpoint with RAG injection. Routes to code or architect agent based on `model` field (see "Agent Routing via Model Name" above).
 
 **Request Headers**:
 - `X-Nexus-Skill` (required): Active product skill name
@@ -300,9 +345,11 @@ augmented = [
 
 ### 4. POST /api/overflow/ingest
 
-**Purpose**: Receive error/debugging submissions from `/solve` command
+**Purpose**: Receive error/debugging submissions from the `/solve` CLI command; run similarity
+search to surface any past confirmed resolutions; return an `issue_id` so the developer can
+later call `/solved` to close the loop.
 
-**Request Headers**: X-Nexus-Skill (optional): Current product context
+**Request Headers**: `X-Nexus-Skill` (optional): Scopes similarity search to the same product
 
 **Request Body**:
 ```json
@@ -317,15 +364,52 @@ augmented = [
 ```json
 {
   "status": "ingested",
-  "suggestion": "This looks like a token expiry race condition. Check middleware order."
+  "issue_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "suggestion": "Similar past issue resolved with: Moving token refresh before auth check fixed the 403s."
 }
 ```
 
-**Used By**: CLI `/solve` command for error analysis/team knowledge sharing
+**`issue_id`**: The CLI stores this on the coder object (`_nexus_last_issue_id`). When the
+developer runs `/solved <explanation>`, the CLI sends `issue_id + resolution` to the resolve
+endpoint to permanently attach the confirmed fix to this issue record.
+
+**`suggestion`**: May be empty string if no close match was found in the knowledge base.
+
+**Used By**: CLI `/solve` command
 
 ---
 
-### 5. GET /v1/models
+### 5. POST /api/overflow/resolve
+
+**Purpose**: Attach a confirmed, developer-verified resolution to a previously ingested issue.
+This is the "close the loop" step — it's what actually builds the knowledge base.
+
+**Request Headers**: `X-Nexus-Skill` (optional)
+
+**Request Body**:
+```json
+{
+  "issue_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "resolution": "The token refresh middleware was running after the auth check. Moving it earlier in the middleware stack fixed the 403s."
+}
+```
+
+**Response** (200):
+```json
+{
+  "status": "resolved",
+  "message": "Resolution recorded. This fix will be surfaced for similar future issues."
+}
+```
+
+**Response** (404): `issue_id` not found or already resolved.
+
+**Used By**: CLI `/solved` command. After this call succeeds, the CLI clears its locally
+stored `_nexus_last_issue_id` to prevent stale re-use.
+
+---
+
+### 6. GET /v1/models
 
 **Purpose**: Health check endpoint
 
@@ -342,7 +426,167 @@ augmented = [
 
 ---
 
-## Implementation Checklist
+## AgentOverflow: Knowledge Base Design
+
+AgentOverflow is the nexus-cli's developer knowledge system. It transforms each debugging
+session into a permanent, searchable record so that the next developer who hits the same
+error gets an immediate, battle-tested fix — without needing to ask the LLM to rediscover it.
+
+### Lifecycle of an Issue
+
+```
+Developer types:    /solve Auth returns 403 after token refresh
+                              │
+                              ▼
+CLI collects:       description + git diff + files_in_context
+                              │
+                              ▼
+POST /api/overflow/ingest ────► backend assigns issue_id
+                              │   ├─ embeds description
+                              │   ├─ similarity search → top-K past resolutions
+                              │   ├─ returns issue_id + suggestion (may be empty)
+                              │   └─ stores pending issue in DB
+                              │
+                    CLI prints suggestion (or "No similar issues found")
+                    CLI stores issue_id on coder object
+                              │
+                    Developer tries the fix (or figures out their own)
+                              │
+Developer types:    /solved Moving token refresh before auth check fixed it
+                              │
+                              ▼
+POST /api/overflow/resolve ───► backend attaches resolution to issue_id
+                                  ├─ re-embeds (description + resolution) together
+                                  ├─ updates vector index
+                                  └─ marks issue as resolved
+```
+
+### Database Schema (Suggested)
+
+```sql
+-- One row per submitted issue
+CREATE TABLE overflow_issues (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    skill       TEXT NOT NULL,                  -- X-Nexus-Skill at time of submission
+    description TEXT NOT NULL,                  -- User's /solve message
+    git_diff    TEXT,                           -- git diff HEAD output
+    files       TEXT[],                         -- files in aider context
+    resolution  TEXT,                           -- populated by /resolve; NULL = unresolved
+    embedding   VECTOR(1536),                   -- embed(description + resolution) once resolved
+                                                -- embed(description) alone while unresolved
+    created_at  TIMESTAMPTZ DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+
+-- Index for fast similarity search (pgvector)
+CREATE INDEX ON overflow_issues USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+```
+
+If you are not using pgvector, the same pattern works with Qdrant, Pinecone, or any
+vector store: store one vector per issue, include `skill` as a metadata filter field.
+
+### Embedding Strategy
+
+**At ingest time** (issue pending, no resolution yet):
+```python
+embedding = embed(issue.description)
+# This lets us do similarity search immediately, even before the fix is known.
+```
+
+**At resolve time** (confirmed fix attached):
+```python
+# Re-embed with resolution included — this is what will be retrieved in future
+embedding = embed(f"{issue.description}\n\nResolution: {issue.resolution}")
+issue.resolved_at = now()
+vector_db.upsert(id=issue.id, vector=embedding, metadata={"skill": issue.skill, "resolved": True})
+```
+
+**Why combine description + resolution in the final embedding?** Because future queries
+come from new issue descriptions. You want semantic overlap between "token refresh causes 403"
+(new query) and "Auth returns 403 after refresh — fix: move middleware earlier" (stored record).
+The resolution text anchors the meaning more precisely than the description alone.
+
+### Retrieval at Chat Time
+
+Every `/v1/chat/completions` request can optionally inject past fixes into `messages[1]`.
+Only retrieve **resolved** issues (those with a non-null `resolution`).
+
+```python
+def search_overflow(query: str, skill: str, limit: int = 3) -> list[dict]:
+    """
+    Find the top-K most similar resolved AgentOverflow issues for the current query.
+
+    Args:
+        query: The user's message (e.g. "Fix the delegation bug in staking contract")
+        skill: Active product skill (for optional pre-filter)
+        limit: Max number of past fixes to inject
+
+    Returns:
+        List of {"description": str, "resolution": str} dicts, most similar first.
+        Returns [] if the vector DB is unavailable (graceful degradation).
+    """
+    try:
+        query_vec = embed(query)
+        results = vector_db.search(
+            vector=query_vec,
+            filter={"skill": skill, "resolved": True},  # only confirmed fixes
+            top_k=limit,
+            min_score=0.82,   # tune this — too low = noise, too high = misses
+        )
+        return [
+            {"description": r.metadata["description"], "resolution": r.metadata["resolution"]}
+            for r in results
+        ]
+    except Exception:
+        return []   # never let KB failures block the LLM
+```
+
+The results are injected into the RAG context block at `messages[1]`:
+
+```python
+if past_fixes:
+    fixes_section = "\n\n".join(
+        f"**Past issue**: {f['description']}\n**Confirmed fix**: {f['resolution']}"
+        for f in past_fixes
+    )
+    rag_context += f"\n\n### Confirmed Fixes from Developer Knowledge Base\n{fixes_section}"
+```
+
+The LLM then sees real confirmed fixes from your team's own codebase alongside the SKILLS.md
+and Confluence context — giving it grounded, product-specific answers instead of generic advice.
+
+### Similarity Threshold Tuning
+
+The `min_score` of `0.82` (cosine similarity) is a starting point. Calibrate it by:
+
+1. Collecting 20–30 representative issue descriptions from developers
+2. Manually labelling which pairs are "same problem" vs "different problem"
+3. Finding the score that best separates the two classes
+
+A score too low causes noisy suggestions ("here's a database fix for your auth problem").
+A score too high causes missed retrievals and the system looks useless. `0.78–0.85` is a
+typical sweet spot for code-related issue embeddings.
+
+### Recommended Embedding Model
+
+Use the same embedding model the rest of the platform uses if one exists. Otherwise:
+- **`text-embedding-3-small`** (OpenAI) — 1536 dimensions, fast, cheap
+- **`text-embedding-ada-002`** — legacy but widely deployed
+- If using Lumin8 as the LLM router, check if it exposes an `/embeddings` endpoint
+
+### What the CLI Does NOT Do
+
+The CLI has no vector DB, no embedding logic, and no knowledge storage. It only:
+
+1. Sends `POST /api/overflow/ingest` with description + context → gets back `issue_id + suggestion`
+2. Stores `issue_id` on the coder object (`self.coder._nexus_last_issue_id`)
+3. Sends `POST /api/overflow/resolve` with `issue_id + resolution` → gets back confirmation
+4. Clears the stored `issue_id` after a successful `/solved` call
+
+All embedding, search, and storage is the backend's responsibility.
+
+---
 
 ### Authentication
 
@@ -373,11 +617,19 @@ augmented = [
 - [ ] Format: `data: {json}\n\n` for each chunk
 - [ ] Terminator: `data: [DONE]\n\n`
 
-### Overflow/Error Analysis
+### AgentOverflow Knowledge Base
 
-- [ ] Accept error description, git diff, and file list
-- [ ] Store for later analysis or return immediate suggestion
-- [ ] Return 200 with status and optional suggestion
+- [ ] `POST /api/overflow/ingest`:
+  - [ ] Accept `description`, `git_diff`, `files_in_context`
+  - [ ] Assign a UUID `issue_id` and persist the issue record
+  - [ ] Run similarity search against existing *resolved* issues (same skill preferred)
+  - [ ] Return `{ status, issue_id, suggestion }` — suggestion empty string if no match
+- [ ] `POST /api/overflow/resolve`:
+  - [ ] Look up `issue_id`; return 404 if not found
+  - [ ] Attach `resolution` text to the issue record
+  - [ ] Re-embed combined `(description + resolution)` and update the vector index
+  - [ ] Return `{ status: "resolved", message }`
+- [ ] At chat time (`/v1/chat/completions`), query overflow KB for past fixes and inject into `messages[1]`
 
 ### Health Check
 
@@ -459,9 +711,6 @@ async def lumin8_stream(model: str, messages: list, **kwargs):
 
 ## Error Handling & Graceful Degradation
 
-### the internal auth proxy Auth Failures
-→ Return 401, prompt CLI to re-authenticate
-
 ### Lumin8/LLM Service Down
 → Return 503, suggest checking LLM status
 
@@ -470,6 +719,12 @@ async def lumin8_stream(model: str, messages: list, **kwargs):
 
 ### Skill Not Found
 → Return 404 or default to "default" skill
+
+### AgentOverflow issue_id Not Found
+→ Return 404 with a clear message — issue may have expired or been already resolved
+
+### Vector DB / Embedding Service Down
+→ Continue without past-fix context; log the error but don't block the LLM response
 
 ### Message Malformed
 → Return 400 with error details
@@ -481,7 +736,7 @@ async def lumin8_stream(model: str, messages: list, **kwargs):
 ### 1. Start the Mock Backend
 
 ```bash
-cd /Users/aeres/Desktop/projects/nexus-cli
+cd /path/to/nexus-cli
 python3 mock_backend.py
 ```
 
@@ -512,10 +767,18 @@ curl http://localhost:8000/api/skills
 # Get single skill
 curl http://localhost:8000/api/skills/staking
 
-# Submit error
+# Submit error — note the issue_id in the response
 curl -X POST http://localhost:8000/api/overflow/ingest \
   -H "Content-Type: application/json" \
-  -d '{"description":"Test error","git_diff":"","files_in_context":[]}'
+  -H "X-Nexus-Skill: staking" \
+  -d '{"description":"Auth 403 after token refresh","git_diff":"","files_in_context":["src/auth.py"]}'
+# → {"status":"ingested","issue_id":"<uuid>","suggestion":"..."}
+
+# Record the confirmed fix (use the issue_id from above)
+curl -X POST http://localhost:8000/api/overflow/resolve \
+  -H "Content-Type: application/json" \
+  -d '{"issue_id":"<uuid>","resolution":"Moved token refresh to run before auth middleware."}'
+# → {"status":"resolved","message":"..."}
 
 # Health check
 curl http://localhost:8000/v1/models
@@ -525,26 +788,34 @@ curl http://localhost:8000/v1/models
 
 ```bash
 # Install nexus-cli
-pip install -e /Users/aeres/Desktop/projects/nexus-cli
+cd /path/to/nexus-cli
+pip install -e .
 
-# Set credentials
-mkdir -p ~/.nexus
-echo '{"credentials":{"username":"test","password":"test"},"skill_mappings":{}}' > ~/.nexus/config
-
-# Run CLI
+# Run CLI (skill detection runs automatically)
 nexus
+
+# Inside the CLI session:
+# /solve Auth middleware returns 403 after token refresh
+# → CLI calls /api/overflow/ingest, prints suggestion + stores issue_id
+#
+# (Try the suggestion, find the real fix...)
+#
+# /solved Moving token refresh middleware earlier in the stack fixed it
+# → CLI calls /api/overflow/resolve with stored issue_id
+# → Knowledge base now records this fix for future developers
 ```
 
 ---
 
 ## Performance & Optimization Tips
 
-1. **Token Caching**: Cache the internal auth proxy tokens to avoid repeated authentication
-2. **Confluence Caching**: Cache Confluence search results for 1-5 minutes
-3. **Skill Metadata Caching**: Load skill list on server startup, cache for session
-4. **SSE Chunking**: Send smaller chunks for more responsive UI
-5. **LLM Timeout**: Set reasonable timeout (e.g., 5 min) for long responses
-6. **Connection Pooling**: Reuse HTTP connections to the internal auth proxy, Lumin8, Confluence
+1. **Confluence Caching**: Cache Confluence search results for 1-5 minutes (results rarely change mid-session)
+2. **Skill Metadata Caching**: Load skill list on server startup, refresh on a background timer
+3. **Overflow KB Caching**: Cache top-K results from the vector DB for common queries (LRU, short TTL)
+4. **SSE Chunking**: Send smaller chunks for more responsive terminal UI
+5. **LLM Timeout**: Set a reasonable timeout (e.g., 5 min) for long responses — aider sessions can be verbose
+6. **Connection Pooling**: Reuse HTTP connections to Lumin8, Confluence, and the vector DB
+7. **Embedding Batching**: When ingesting issues, batch embedding calls if multiple arrive simultaneously
 
 ---
 
@@ -563,11 +834,12 @@ nexus
 
 Before implementation, confirm:
 
-1. **Lumin8 Integration**: How does Lumin8 provide streaming? (async generator? WebSocket?)
-2. **Confluence**: Is Confluence available? How do we authenticate?
-3. **Auth proxy**: Exact authentication flow? (Basic auth? Token exchange?)
-4. **Skills Storage**: Database? Files? Config?
-5. **Error Logging**: Where should errors be logged? (file? external service?)
+1. **Lumin8 Integration**: How does Lumin8 provide streaming? (async generator? WebSocket? OpenAI-compatible SDK?)
+2. **Confluence**: Is Confluence available? What auth method and space key(s) should be searched?
+3. **Skills Storage**: Database? Filesystem? Config service? (Influences how SKILLS.md files are loaded per product)
+4. **Vector DB**: What embedding model and vector store are available? (pgvector in Postgres? Pinecone? Qdrant?)
+5. **AgentOverflow Retention**: How long should unresolved issues be kept before expiry?
+6. **Error Logging**: Centralised logging service? (Datadog, Splunk, etc.) — needed for observability around AgentOverflow usage
 
 ---
 
@@ -587,17 +859,18 @@ You now have:
 
 ✅ Complete request/response flow with examples
 ✅ Message ordering rules (CRITICAL)
-✅ API endpoint specifications
+✅ API endpoint specifications (including /api/overflow/resolve)
+✅ AgentOverflow knowledge base design (lifecycle, schema, retrieval, embedding strategy)
 ✅ Implementation checklist
 ✅ Error handling guidance
-✅ Testing instructions
+✅ Testing instructions with curl examples
 ✅ Performance tips
 ✅ Common pitfalls to avoid
 
-**Start with**: Authentication → Health check → Chat completions → Skills → Overflow
+**Start with**: Health check → Chat completions → Skills → AgentOverflow ingest → AgentOverflow resolve
 
 **Test with**: Mock backend → CLI with real backend
 
-**Deploy to**: Production the internal auth proxy + Lumin8 environment
+**Deploy to**: Internal network alongside Lumin8
 
 Good luck! 🚀
