@@ -1,8 +1,7 @@
 name: Check PyPI Version
 
-# Check to be sure `pip install aider-chat` installs the most recently published version.
+# Check to be sure `pip install nexus-cli` installs the most recently published version.
 # If dependencies get yanked, it may render the latest version uninstallable.
-# See https://github.com/Aider-AI/aider/issues/3699 for example.
 
 on:
   schedule:
@@ -15,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Set up Python ${{ matrix.python-version }}
@@ -23,26 +22,26 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install aider-chat
-        run: pip install aider-chat
+      - name: Install nexus-cli
+        run: pip install nexus-cli
 
-      - name: Get installed aider version
+      - name: Get installed nexus version
         id: installed_version
         run: |
           set -x # Enable debugging output
-          aider_version_output=$(aider --version)
+          nexus_version_output=$(nexus --version)
           if [ $? -ne 0 ]; then
-            echo "Error: 'aider --version' command failed."
+            echo "Error: 'nexus --version' command failed."
             exit 1
           fi
-          echo "Raw aider --version output: $aider_version_output"
+          echo "Raw nexus --version output: $nexus_version_output"
 
           # Extract version number (format X.Y.Z)
-          version_num=$(echo "$aider_version_output" | grep -oP '\d+\.\d+\.\d+')
+          version_num=$(echo "$nexus_version_output" | grep -oP '\d+\.\d+\.\d+')
 
           # Check if grep found anything
           if [ -z "$version_num" ]; then
-            echo "Error: Could not extract version number using grep -oP '\d+\.\d+\.\d+' from output: $aider_version_output"
+            echo "Error: Could not extract version number using grep -oP '\d+\.\d+\.\d+' from output: $nexus_version_output"
             exit 1
           fi
 
@@ -80,7 +79,7 @@ jobs:
           echo "Installed version: ${{ steps.installed_version.outputs.version }}"
           echo "Latest tag version: ${{ steps.latest_tag.outputs.tag }}"
           if [ "${{ steps.installed_version.outputs.version }}" != "${{ steps.latest_tag.outputs.tag }}" ]; then
-            echo "Error: Installed aider version (${{ steps.installed_version.outputs.version }}) does not match the latest tag (${{ steps.latest_tag.outputs.tag }})."
+            echo "Error: Installed nexus version (${{ steps.installed_version.outputs.version }}) does not match the latest tag (${{ steps.latest_tag.outputs.tag }})."
             exit 1
           fi
           echo "Versions match."

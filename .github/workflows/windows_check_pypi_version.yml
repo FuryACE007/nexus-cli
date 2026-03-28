@@ -1,8 +1,7 @@
 name: Windows Check PyPI Version
 
-# Check to be sure `pip install aider-chat` installs the most recently published version on Windows.
+# Check to be sure `pip install nexus-cli` installs the most recently published version on Windows.
 # If dependencies get yanked, it may render the latest version uninstallable.
-# See https://github.com/Aider-AI/aider/issues/3699 for example.
 
 on:
   schedule:
@@ -15,7 +14,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13"]
     defaults:
       run:
         shell: pwsh # Use PowerShell for all run steps
@@ -26,25 +25,25 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install aider-chat
-        run: pip install aider-chat
+      - name: Install nexus-cli
+        run: pip install nexus-cli
 
-      - name: Get installed aider version
+      - name: Get installed nexus version
         id: installed_version
         run: |
-          Write-Host "Running 'aider --version'..."
-          $aider_version_output = aider --version
+          Write-Host "Running 'nexus --version'..."
+          $nexus_version_output = nexus --version
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Error: 'aider --version' command failed."
+            Write-Error "Error: 'nexus --version' command failed."
             exit 1
           }
-          Write-Host "Raw aider --version output: $aider_version_output"
+          Write-Host "Raw nexus --version output: $nexus_version_output"
 
           # Extract version number (format X.Y.Z) using PowerShell regex
-          $match = [regex]::Match($aider_version_output, '\d+\.\d+\.\d+')
+          $match = [regex]::Match($nexus_version_output, '\d+\.\d+\.\d+')
 
           if (-not $match.Success) {
-            Write-Error "Error: Could not extract version number using regex '\d+\.\d+\.\d+' from output: $aider_version_output"
+            Write-Error "Error: Could not extract version number using regex '\d+\.\d+\.\d+' from output: $nexus_version_output"
             exit 1
           }
           $version_num = $match.Value
@@ -84,7 +83,7 @@ jobs:
           Write-Host "Installed version: ${{ steps.installed_version.outputs.version }}"
           Write-Host "Latest tag version: ${{ steps.latest_tag.outputs.tag }}"
           if ("${{ steps.installed_version.outputs.version }}" -ne "${{ steps.latest_tag.outputs.tag }}") {
-            Write-Error "Error: Installed aider version (${{ steps.installed_version.outputs.version }}) does not match the latest tag (${{ steps.latest_tag.outputs.tag }})."
+            Write-Error "Error: Installed nexus version (${{ steps.installed_version.outputs.version }}) does not match the latest tag (${{ steps.latest_tag.outputs.tag }})."
             exit 1
           }
           Write-Host "Versions match."
