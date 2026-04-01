@@ -1,0 +1,124 @@
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#ffffff',
+  'primaryTextColor': '#1a1a1a',
+  'primaryBorderColor': '#555555',
+  'lineColor': '#555555',
+  'textColor': '#1a1a1a',
+  'edgeLabelBackground': '#ffffff',
+  'fontSize': '15px'
+}}}%%
+
+flowchart TD
+
+%% ─── PHASE 1: DISCOVERY PIPELINE ──────────────────────────────────────────
+
+    PHASE1(["🔍  PHASE 1 — DISCOVERY PIPELINE"]):::phaseLabel
+
+    REPOS["📦 Product Repos"]:::input
+    CONFLUENCE["📄 Confluence Pages"]:::input
+    INGEST["Ingest under\nSkill Name = Product Name"]:::process
+
+    REPOS --> INGEST
+    CONFLUENCE --> INGEST
+    PHASE1 -.-> INGEST
+
+    INGEST --> COUNCIL
+
+    subgraph COUNCIL["  LLM Council  "]
+        direction LR
+        DOMAIN["🧠 Domain\nExpert"]:::agent
+        ARCHITECT["🏗️ Architect"]:::agent
+        QUALITY["✅ Quality\nExpert"]:::agent
+        SYNTH["🔄 Synthesizer\nAgent"]:::agent
+
+        DOMAIN --> SYNTH
+        ARCHITECT --> SYNTH
+        QUALITY --> SYNTH
+    end
+
+    SYNTH --> SIP["📋 SIP\nSkill Improvement Proposal"]:::doc
+    SYNTH --> GAPS["⚠️ Gap Analysis\nCode vs Docs · Code vs Standards\nSuggested Fixes"]:::warning
+
+    SIP --> SME{"SME\nReview"}:::decision
+
+    SME -->|"✅ Approve"| SKILL_MD["📝 SKILL.md\nGenerated"]:::success
+    SME -->|"❌ Reject / 🔄 Request Change"| COUNCIL
+
+    SKILL_MD --> KB
+
+%% ─── KNOWLEDGE BASE ────────────────────────────────────────────────────────
+
+    subgraph KB["  💾  NEXUS KNOWLEDGE BASE  "]
+        direction LR
+        SKILLS_STORE["📝 SKILL.md\nFiles"]:::kbNode
+        SQLITE["🗄️ SQLite\nIssues & metadata"]:::kbNode
+        CHROMA["🔮 ChromaDB\nVector embeddings\n& resolved fixes"]:::kbNode
+        CONF_STORE["📄 Confluence\nIndexed chunks"]:::kbNode
+    end
+
+    GAPS --> SQLITE
+
+%% ─── PHASE 2: DEVELOPER INTERFACE ─────────────────────────────────────────
+
+    PHASE2(["🖥️  PHASE 2 — DEVELOPER INTERFACE  CLI / Chat UI"]):::phaseLabel
+
+    KB --> PHASE2
+
+    PHASE2 --> STARTUP["Session Startup\nAuto-detect skill · Fetch SKILL.md"]:::process
+
+    STARTUP --> ARCH["🧠 Architect Model\nPlans changes in natural language"]:::agent
+
+    subgraph RAG["  RAG Context Injected into Every Request  "]
+        direction LR
+        R1["📝 SKILL.md"]:::kbNode
+        R2["📄 Confluence chunks"]:::kbNode
+        R3["🔮 Past fixes\nfrom AgentOverflow"]:::kbNode
+    end
+
+    KB --> RAG
+    RAG --> ARCH
+
+    ARCH --> EDITOR["✏️ Editor Model\nGenerates SEARCH/REPLACE edits"]:::agent
+    EDITOR --> FILES["📁 Code Changes\napplied to project files"]:::process
+
+%% ─── PHASE 3: AGENTOVERFLOW ────────────────────────────────────────────────
+
+    PHASE3(["🔁  PHASE 3 — AGENTOVERFLOW  Team Knowledge Capture"]):::phaseLabel
+
+    FILES --> PHASE3
+
+    PHASE3 --> SOLVE["/solve\nSubmit issue + get past fix suggestion"]:::overflow
+    SOLVE --> INGEST_OVF["POST /api/overflow/ingest\nStored as pending in SQLite\nChromaDB similarity search"]:::process
+
+    INGEST_OVF --> SUGGESTION["💡 Past fix surfaced\nif similar issue found"]:::success
+    SUGGESTION -.->|"developer applies fix"| FILES
+
+    INGEST_OVF --> COMMIT["/commit  ← zero developer effort\nAuto-captures git diff"]:::overflow
+    COMMIT --> RESOLVE_API["POST /api/overflow/resolve\nBackend LLM summarizes diff\nChromaDB upserted"]:::process
+
+    RESOLVE_API --> KNOWLEDGE["✅ Verified fix stored\nin knowledge base"]:::success
+
+    PHASE3 --> SOLVED["/solved optional explicit note\nPOST /api/overflow/resolve"]:::overflow
+    SOLVED --> RESOLVE_API
+
+%% ─── KNOWLEDGE LOOP CLOSES ─────────────────────────────────────────────────
+
+    KNOWLEDGE --> CHROMA
+    CHROMA -->|"surfaces instantly\nfor next developer"| R3
+
+%% ─── STYLES ────────────────────────────────────────────────────────────────
+
+    classDef phaseLabel fill:#2c3e50,stroke:#2c3e50,color:#ffffff,font-weight:bold,rx:8
+    classDef input fill:#d6eaf8,stroke:#2980b9,color:#1a1a1a
+    classDef process fill:#eaf4fb,stroke:#5dade2,color:#1a1a1a
+    classDef agent fill:#d5f5e3,stroke:#27ae60,color:#1a1a1a,font-weight:bold
+    classDef doc fill:#fef9e7,stroke:#f39c12,color:#1a1a1a
+    classDef warning fill:#fdebd0,stroke:#e67e22,color:#1a1a1a
+    classDef success fill:#d4efdf,stroke:#27ae60,color:#1a1a1a
+    classDef decision fill:#f9ebea,stroke:#e74c3c,color:#1a1a1a
+    classDef kbNode fill:#fef9e7,stroke:#f39c12,color:#1a1a1a
+    classDef overflow fill:#f5eef8,stroke:#8e44ad,color:#1a1a1a,font-weight:bold
+
+    style COUNCIL fill:#eafaf1,stroke:#27ae60,stroke-width:2px,color:#1a1a1a
+    style KB fill:#fef9e7,stroke:#f39c12,stroke-width:2px,color:#1a1a1a
+    style RAG fill:#ebf5fb,stroke:#5dade2,stroke-width:2px,color:#1a1a1a

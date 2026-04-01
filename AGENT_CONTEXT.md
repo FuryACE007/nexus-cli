@@ -211,62 +211,57 @@ def preproc_user_input(self, inp):
 
 ---
 
-### 3.5 `aider/commands.py` — One New Method
+### 3.5 `aider/commands.py` — Two New Methods (`cmd_solve`, `cmd_solved`)
 
-New method `cmd_solve()` added to the `Commands` class (~line 1682):
+`cmd_solve()` always returns an answer immediately. The backend runs the **semantic cache
+decision automatically** — no human in the loop, no staging area. The developer just gets
+an answer.
+
+**Design principle**: aider's repo-map already provides 8× larger token budget when no files are manually `/add`'d — forcing `/add` before `/solve` would punish the correct usage pattern. `cmd_solve` therefore sends the **full codebase structure** (`get_all_relative_files()`), not just explicitly added files.
+
+**Payload sent to backend**:
 ```python
-def cmd_solve(self, args):
-    """Submit an error/issue to the Nexus AgentOverflow API for analysis"""
-    import subprocess
-    import requests
-    from aider.nexus_auth import NEXUS_BASE_URL
-
-    error_description = args.strip() if args and args.strip() else "No description provided"
-
-    # Capture git diff
-    git_diff = ""
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--no-color"],
-            cwd=self.coder.root,
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            git_diff = result.stdout
-    except Exception:
-        pass
-
-    try:
-        files_in_context = list(self.coder.get_inchat_relative_files())
-    except Exception:
-        files_in_context = []
-
-    payload = {
-        "description": error_description,
-        "git_diff": git_diff,
-        "files_in_context": files_in_context,
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if hasattr(self.coder.main_model, "_nexus_extra_headers"):
-        headers.update(self.coder.main_model._nexus_extra_headers)
-
-    try:
-        resp = requests.post(
-            f"{NEXUS_BASE_URL}/api/overflow/ingest",
-            json=payload, headers=headers, timeout=30,
-        )
-        if resp.status_code == 200:
-            result = resp.json()
-            self.io.tool_output("Overflow analysis submitted successfully.")
-            suggestion = result.get("suggestion", "")
-            if suggestion:
-                self.io.tool_output(suggestion)
-        else:
-            self.io.tool_error(f"Overflow API returned HTTP {resp.status_code}")
-    except Exception as e:
-        self.io.tool_error(f"Failed to reach overflow API: {e}")
+payload = {
+    # Core query
+    "description": error_description,
+    # Git context
+    "git_diff":       repo.get_diffs(),            # may be empty — soft warn only
+    "dirty_files":    repo.get_dirty_files(),
+    "recent_commits": ["last 5 git log lines"],    # git log --oneline -5
+    # Codebase structure (mirrors aider repo-map universe)
+    "all_files":      coder.get_all_relative_files(),    # full git-tracked list
+    "chat_files":     coder.get_inchat_relative_files(), # explicitly /add'd (50× PageRank boost)
+    "ident_mentions": coder.get_ident_mentions(description),  # identifiers in description
+    "file_mentions":  coder.get_file_mentions(description),   # filenames in description
+    # Session quality signals (used by backend for confidence scoring)
+    "lint_outcome":   coder.lint_outcome,     # None / True / False
+    "test_outcome":   coder.test_outcome,
+    # Conversation context (last 3 exchanges for retry/escalation context)
+    "recent_messages": (coder.done_messages + coder.cur_messages)[-6:],
+}
 ```
+
+**Backend semantic cache decision tree** (fully automatic, no human in the loop):
+```
+EMBED description (+ ident_mentions) → COSINE SIMILARITY SEARCH
+    ≥ 0.87  → CACHE HIT   (return stored answer, skip LLM,  cached=True,  persisted=False)
+  0.65–0.87 → SIMILAR     (call LLM, serve answer, skip persist,           persisted=False)
+    < 0.65  → NOVEL       (call LLM + RAG, compute confidence)
+                              confidence ≥ 0.72 → AUTO-PERSIST, 6-month TTL (persisted=True)
+                              confidence < 0.72 → SERVE ONLY               (persisted=False)
+```
+
+**TTL**: All persisted entries have a flat **6-month TTL**, reset on each cache hit.
+**Deduplication gate**: Before storing, a final similarity check at 0.80 prevents duplicates.
+
+**Response fields** the CLI reads:
+- `suggestion` — the answer shown to the developer (always populated)
+- `issue_id` — stored for auto-resolve on `/commit` and `/solved`
+- `cached` — `True` = served from KB cache (prints ⚡)
+- `confidence_score` — if < 0.60, a low-confidence warning is surfaced
+- `persisted` — `True` = novel entry auto-stored in team KB (prints 📚)
+
+`cmd_solved()` enriches the cached entry with the real committed fix. On `/commit`, `cmd_solved` is triggered automatically (`_nexus_maybe_auto_resolve()`): it captures `git show HEAD` and sends it to `/api/overflow/resolve`. The backend uses the LLM to summarize the diff and upgrades the KB entry — no developer input needed.
 
 ---
 
@@ -473,21 +468,33 @@ The `skill_content` is what gets injected as RAG context (see 4.3).
 
 ### 4.6 `POST /api/overflow/ingest`
 
-Receives error submissions from `/solve` command:
+Receives rich context from `/solve` and **always returns an answer immediately**. Backend runs
+semantic cache decision automatically — no human in the loop.
+
+Request (key fields):
 ```json
 {
-  "description": "The token refresh is returning 403 with valid credentials",
-  "git_diff": "diff --git a/src/auth.py ...",
-  "files_in_context": ["src/auth.py", "src/middleware.py"]
+  "description":    "The token refresh is returning 403 with valid credentials",
+  "git_diff":       "diff --git a/src/auth.py ...",
+  "all_files":      ["src/auth.py", "src/middleware.py", "tests/test_auth.py"],
+  "chat_files":     ["src/auth.py"],
+  "ident_mentions": ["refresh_token", "AuthMiddleware"],
+  "file_mentions":  ["auth.py"],
+  "lint_outcome":   null,
+  "test_outcome":   false
 }
 ```
 
 Response:
 ```json
 {
-  "status": "received",
-  "ticket_id": "NEXUS-1234",
-  "suggestion": "This looks like a clock skew issue. Check server time sync."
+  "status": "ok",
+  "issue_id": "a1b2c3d4-...",
+  "suggestion": "Check that TokenRefreshMiddleware runs before AuthMiddleware...",
+  "cached": false,
+  "cache_hit_similarity": null,
+  "confidence_score": 0.82,
+  "persisted": true
 }
 ```
 
@@ -543,21 +550,40 @@ User types: "/solve auth middleware returning 403"
     ▼
 commands.cmd_solve("auth middleware returning 403")
     │
-    ├─► git diff --no-color  (captures current uncommitted changes)
-    ├─► coder.get_inchat_relative_files()  (files in current context)
+    ├─► git diff + dirty_files + recent_commits (git context)
+    ├─► coder.get_all_relative_files()          (full codebase — NOT just /add'd files)
+    ├─► coder.get_inchat_relative_files()       (explicitly /add'd, higher signal)
+    ├─► coder.get_ident_mentions(description)   (identifiers in description)
+    ├─► coder.get_file_mentions(description)    (filenames in description)
+    ├─► coder.lint_outcome, test_outcome        (session quality signals)
+    ├─► (coder.done_messages + cur_messages)[-6:]  (recent conversation)
     │
     ▼
-POST /api/overflow/ingest
+POST /api/overflow/ingest  (Headers: X-Nexus-Skill)
 {
   "description": "auth middleware returning 403",
   "git_diff": "diff --git a/...",
-  "files_in_context": ["src/auth.py"]
+  "all_files": ["src/auth.py", "src/middleware.py", ...],
+  "chat_files": ["src/auth.py"],
+  "ident_mentions": ["AuthMiddleware"],
+  "file_mentions": ["auth.py"],
+  "lint_outcome": null, "test_outcome": false,
+  "recent_messages": [...]
 }
-Headers: X-Nexus-Skill
+    │
+    ▼ Backend: embed → similarity search → cache hit or LLM → auto-persist if confident
     │
     ▼
-Prints: "Overflow analysis submitted successfully."
-Prints: suggestion from response (if any)
+Response: { suggestion, issue_id, cached, confidence_score, persisted }
+    │
+    ▼
+CLI prints:
+  ⚡ "Cache hit" (if cached=true)  OR  "🤖 Analyzed with LLM"
+  📚 "Solution saved to KB" (if persisted=true)
+  💡 The suggestion text
+  Low-confidence warning if confidence_score < 0.60
+
+Stores issue_id internally → auto-resolved on next /commit
 ```
 
 ---

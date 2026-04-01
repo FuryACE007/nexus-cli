@@ -1,0 +1,36 @@
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#ffffff',
+  'primaryTextColor': '#1a1a1a',
+  'primaryBorderColor': '#555',
+  'lineColor': '#555',
+  'edgeLabelBackground': '#ffffff',
+  'fontSize': '15px'
+}}}%%
+
+flowchart TD
+
+    ISSUE["🐛 Developer hits a blocker"]:::input
+
+    ISSUE --> SOLVE["/solve  describe the error"]:::cmd
+    SOLVE -->|"POST /api/overflow/ingest"| SEARCH["ChromaDB similarity search\nacross resolved fixes"]:::process
+    SEARCH -->|"match found"| HINT["💡 Past fix surfaced\ninstantly in the CLI"]:::success
+    SEARCH -->|"no match yet"| PENDING["Issue stored as pending\nin SQLite"]:::neutral
+
+    HINT --> FIX["Developer applies\nthe fix"]:::process
+    PENDING --> FIX
+
+    FIX --> COMMIT["/commit"]:::cmd
+    COMMIT -->|"auto-triggered\nzero developer effort"| DIFF["Capture git show HEAD diff"]:::process
+    DIFF -->|"POST /api/overflow/resolve"| LLM["Backend LLM summarizes\ndiff into readable resolution"]:::process
+    LLM --> STORE["✅ Verified fix stored\nin ChromaDB"]:::success
+
+    FIX --> SOLVED["/solved  optional explicit note"]:::cmd
+    SOLVED -->|"POST /api/overflow/resolve"| STORE
+
+    STORE -->|"next developer hits same error"| HINT
+
+    classDef input    fill:#d6eaf8,stroke:#2980b9,color:#1a1a1a
+    classDef cmd      fill:#f5eef8,stroke:#8e44ad,color:#1a1a1a,font-weight:bold
+    classDef process  fill:#eaf4fb,stroke:#5dade2,color:#1a1a1a
+    classDef success  fill:#d4efdf,stroke:#27ae60,color:#1a1a1a,font-weight:bold
+    classDef neutral  fill:#f2f3f4,stroke:#999,color:#1a1a1a

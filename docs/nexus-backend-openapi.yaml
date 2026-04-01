@@ -181,22 +181,29 @@ paths:
 
   /api/overflow/ingest:
     post:
-      summary: Submit error/issue for AgentOverflow analysis
+      summary: Submit error/issue for AgentOverflow — always returns an answer immediately
       description: |
-        Receives an error description, git diff, and file context from the CLI's
-        /solve command. The backend can analyze this to provide debugging suggestions
-        or store it for team knowledge sharing.
+        Receives a developer query from the CLI's `/solve` command and **always returns an
+        answer immediately**. The backend applies a semantic cache decision automatically:
 
-        The response includes an `issue_id` that the CLI stores locally. When the developer
-        finds the actual fix, they call `/solved <explanation>` which sends the `issue_id`
-        plus the confirmed resolution to `/api/overflow/resolve`.
+        - **similarity ≥ 0.87** → CACHE HIT: return stored answer, skip LLM
+        - **0.65 ≤ similarity < 0.87** → SIMILAR: call LLM, return answer, skip persist
+        - **similarity < 0.65** → NOVEL: call LLM, auto-persist if confidence ≥ 0.72
+
+        No human approval or staging is required. The `issue_id` in the response lets the
+        developer optionally call `/api/overflow/resolve` later to enrich the cached entry
+        with the real committed diff.
+
+        **Context richness**: The CLI sends the full codebase structure (mirroring aider's
+        repo-map PageRank universe) so the backend can rank files by relevance. `chat_files`
+        carry a 50× signal boost; `ident_mentions` and `file_mentions` carry 10×.
       parameters:
         - name: X-Nexus-Skill
           in: header
           required: false
           schema:
             type: string
-          description: Active product context, used to scope the knowledge base lookup
+          description: Active product context — scopes the similarity search to the same product KB
       requestBody:
         required: true
         content:
@@ -208,22 +215,86 @@ paths:
               properties:
                 description:
                   type: string
-                  description: User's description of the error/issue
+                  description: User's description of the error/issue (primary embedding input)
                 git_diff:
                   type: string
-                  description: Output of `git diff --no-color` (unstaged changes)
-                files_in_context:
+                  description: Output of `git diff` for uncommitted changes. May be empty — never block on this.
+                dirty_files:
                   type: array
                   items:
                     type: string
-                  description: Relative paths of files currently in the aider chat context
+                  description: Files modified since last commit (from `repo.get_dirty_files()`)
+                recent_commits:
+                  type: array
+                  items:
+                    type: string
+                  description: Last 5 commit messages from `git log --oneline -5` for temporal context
+                all_files:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Full list of git-tracked files in the repo (from `coder.get_all_relative_files()`).
+                    This mirrors the universe that aider's repo-map PageRank operates on.
+                chat_files:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Files explicitly added to the aider chat context via `/add`.
+                    Carry a 50× PageRank boost — highest relevance signal.
+                ident_mentions:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Identifiers (function names, class names, variables) extracted from the description
+                    by `coder.get_ident_mentions()`. Used for 10× PageRank boosting.
+                file_mentions:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    File paths extracted from the description by `coder.get_file_mentions()`.
+                    Used for 10× PageRank boosting alongside ident_mentions.
+                lint_outcome:
+                  type: boolean
+                  nullable: true
+                  description: "`null`=not run, `true`=passed, `false`=failed. Used in confidence scoring."
+                test_outcome:
+                  type: boolean
+                  nullable: true
+                  description: "`null`=not run, `true`=passed, `false`=failed. Used in confidence scoring."
+                recent_messages:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                        enum: [user, assistant, system]
+                      content:
+                        type: string
+                  description: Last 6 messages from the aider conversation (3 exchanges) for retry context
             example:
               description: "Authentication middleware returns 403 after token refresh"
               git_diff: "diff --git a/auth.py b/auth.py\n..."
-              files_in_context: ["src/auth.py", "src/middleware.py"]
+              dirty_files: ["src/auth.py"]
+              recent_commits: ["fix: token refresh", "chore: bump deps"]
+              all_files: ["src/auth.py", "src/middleware.py", "tests/test_auth.py"]
+              chat_files: ["src/auth.py"]
+              ident_mentions: ["refresh_token", "AuthMiddleware"]
+              file_mentions: ["auth.py"]
+              lint_outcome: null
+              test_outcome: false
+              recent_messages:
+                - role: "user"
+                  content: "The refresh endpoint keeps 403-ing"
+                - role: "assistant"
+                  content: "Let me check the middleware order..."
       responses:
         "200":
-          description: Issue ingested and queued for analysis
+          description: Answer returned immediately. Cached, novel, or served-only — transparent to the developer.
           content:
             application/json:
               schema:
@@ -231,25 +302,48 @@ paths:
                 required:
                   - status
                   - issue_id
+                  - suggestion
+                  - cached
+                  - persisted
                 properties:
                   status:
                     type: string
-                    example: "ingested"
+                    example: "ok"
                   issue_id:
                     type: string
                     format: uuid
                     description: |
-                      Stable identifier for this issue record. The CLI stores this locally
-                      so the developer can call /solved later to attach a confirmed resolution.
+                      Stable identifier for this session. Stored by the CLI so the developer can
+                      call `/api/overflow/resolve` to enrich the entry with the real committed fix.
                   suggestion:
                     type: string
+                    description: The answer shown to the developer — always populated.
+                  cached:
+                    type: boolean
+                    description: "`true` = answer served from KB cache (similarity ≥ 0.87), no LLM call made."
+                  cache_hit_similarity:
+                    type: number
+                    nullable: true
+                    description: Cosine similarity of the matched KB entry. `null` if not a cache hit.
+                  confidence_score:
+                    type: number
+                    nullable: true
                     description: |
-                      Optional immediate suggestion surfaced by similarity search against past
-                      resolved issues. Empty string if no close match was found.
+                      Computed LLM confidence 0–1. Used to decide persistence.
+                      `null` if served from cache. If < 0.60, the CLI shows a low-confidence warning.
+                  persisted:
+                    type: boolean
+                    description: |
+                      `true` = novel query, LLM response was confident enough (≥ 0.72), and the
+                      answer was auto-stored in the KB with a 6-month TTL.
               example:
-                status: "ingested"
+                status: "ok"
                 issue_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-                suggestion: "This looks like a token expiry race condition. Check the refresh_token middleware order."
+                suggestion: "The token expiry check runs before the refresh call on line 47. Move TokenRefreshMiddleware above AuthMiddleware in your ASGI stack."
+                cached: false
+                cache_hit_similarity: null
+                confidence_score: 0.82
+                persisted: true
 
   /api/overflow/resolve:
     post:

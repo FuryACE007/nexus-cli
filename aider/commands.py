@@ -1805,18 +1805,23 @@ Just show me the edits I need to make.
     # ── /solve command ────────────────────────────────────────────────────────
 
     def cmd_solve(self, args):
-        """Submit an issue to AgentOverflow for analysis and similar-fix suggestions.
+        """Ask AgentOverflow to solve a dev problem — always returns an answer immediately.
 
-        Usage: /solve <description of the error>
+        Usage: /solve <description of the problem or error>
 
-        Sends the error description, current git diff, and files in context to
-        the AgentOverflow backend. The backend returns an immediate suggestion
-        and stores the issue for team knowledge sharing.
+        The backend runs a semantic cache decision automatically — no human in the loop,
+        no staging area. You always get an answer right away.
 
-        The issue is automatically marked as resolved the next time you /commit —
-        the commit message becomes the resolution. No extra steps needed.
+          • Cache HIT  (similarity ≥ 0.87): ⚡ cached answer returned instantly, no LLM call.
+          • SIMILAR    (0.65–0.87): LLM called with related context, served but not stored.
+          • NOVEL      (< 0.65) + confidence ≥ 0.72: LLM answer auto-stored (6-month TTL).
+          • NOVEL      (< 0.65) + low confidence: answered but not stored.
 
-        If you want to add a more detailed explanation, use /solved before committing.
+        You do NOT need to /add files first — the full codebase structure is captured
+        automatically from aider's repo-map. Files you have /add'd carry extra weight.
+
+        After you fix the issue and /commit, the knowledge base is updated automatically.
+        Use /solved only if you want to add a more detailed note than the commit provides.
 
         Example:
             /solve auth middleware returning 403 after token refresh
@@ -1829,39 +1834,109 @@ Just show me the edits I need to make.
 
         error_description = args.strip() if args and args.strip() else "No description provided"
 
-        # Capture git diff
+        # ── 1. Git diff (soft warning only — never block on missing diff) ──────────
         git_diff = ""
+        dirty_files: list = []
+        recent_commits: list = []
         try:
-            result = subprocess.run(
-                ["git", "diff", "--no-color"],
-                cwd=self.coder.root,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                git_diff = result.stdout
+            if self.coder.repo:
+                git_diff = self.coder.repo.get_diffs() or ""
+                dirty_files = list(self.coder.repo.get_dirty_files() or [])
+                # Capture the last 5 commit messages for temporal context
+                try:
+                    log_result = subprocess.run(
+                        ["git", "log", "--oneline", "-5", "--no-decorate"],
+                        cwd=self.coder.root,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if log_result.returncode == 0:
+                        recent_commits = [
+                            line.strip()
+                            for line in log_result.stdout.splitlines()
+                            if line.strip()
+                        ]
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # Get files currently in context
-        try:
-            files_in_context = list(self.coder.get_inchat_relative_files())
-        except Exception:
-            files_in_context = []
+        if not git_diff:
+            self.io.tool_warning(
+                "No uncommitted changes found — submitting without a diff."
+                " The backend will rely on the repo-map and your description."
+            )
 
-        # Build payload
+        # ── 2. File context — use the full tracked codebase, not just /add'd files ─
+        # aider's repo-map PageRank already scores ALL tracked files; we send the same
+        # full list so the backend can replicate that ranking if needed.
+        try:
+            all_files = list(self.coder.get_all_relative_files())
+        except Exception:
+            all_files = []
+
+        # Files explicitly added to chat (higher signal — PageRank gives these 50× boost)
+        try:
+            chat_files = list(self.coder.get_inchat_relative_files())
+        except Exception:
+            chat_files = []
+
+        # ── 3. Identifier & file mentions from the description ─────────────────────
+        # aider uses these same signals to boost PageRank for relevant files.
+        try:
+            ident_mentions = list(self.coder.get_ident_mentions(error_description))
+        except Exception:
+            ident_mentions = []
+
+        try:
+            file_mentions = list(self.coder.get_file_mentions(error_description))
+        except Exception:
+            file_mentions = []
+
+        # ── 4. Session quality signals ─────────────────────────────────────────────
+        # lint_outcome / test_outcome are set by aider after auto-lint / auto-test runs.
+        # None = not run yet, True = passed, False = failed.
+        lint_outcome = getattr(self.coder, "lint_outcome", None)
+        test_outcome = getattr(self.coder, "test_outcome", None)
+
+        # ── 5. Recent conversation messages (last 6 turns for context continuity) ──
+        recent_messages: list = []
+        try:
+            history = list(self.coder.done_messages or [])
+            cur = list(self.coder.cur_messages or [])
+            combined = history + cur
+            # Keep last 6 messages (3 exchanges), avoid giant payloads
+            recent_messages = combined[-6:]
+        except Exception:
+            pass
+
+        # ── 6. Build the enriched payload ──────────────────────────────────────────
         payload = {
+            # Core query
             "description": error_description,
+            # Git context
             "git_diff": git_diff,
-            "files_in_context": files_in_context,
+            "dirty_files": dirty_files,
+            "recent_commits": recent_commits,
+            # Codebase structure (aider repo-map universe)
+            "all_files": all_files,
+            "chat_files": chat_files,         # explicitly /add'd — higher relevance
+            "ident_mentions": ident_mentions,  # identifiers in the description
+            "file_mentions": file_mentions,    # file paths in the description
+            # Session quality signals
+            "lint_outcome": lint_outcome,
+            "test_outcome": test_outcome,
+            # Conversation history for retry / escalation context
+            "recent_messages": recent_messages,
         }
 
-        # Get auth headers (includes X-Nexus-Skill)
+        # ── 7. Auth headers ────────────────────────────────────────────────────────
         headers = {"Content-Type": "application/json"}
         if hasattr(self.coder.main_model, "_nexus_extra_headers"):
             headers.update(self.coder.main_model._nexus_extra_headers)
 
+        # ── 8. POST to backend and surface result ──────────────────────────────────
         try:
             resp = requests.post(
                 f"{NEXUS_BASE_URL}/api/overflow/ingest",
@@ -1873,21 +1948,37 @@ Just show me the edits I need to make.
                 result = resp.json()
                 suggestion = result.get("suggestion", "")
                 issue_id = result.get("issue_id", "")
+                cached = result.get("cached", False)
+                confidence = result.get("confidence_score")
+                persisted = result.get("persisted", False)
 
-                self.io.tool_output("✅ Submitted to AgentOverflow.")
+                if cached:
+                    self.io.tool_output("⚡ Cache hit — returning similar solution from knowledge base.")
+                else:
+                    self.io.tool_output("🤖 Analyzed with LLM.")
+                    if persisted:
+                        self.io.tool_output("   📚 Solution saved to team knowledge base.")
+
                 if suggestion:
-                    self.io.tool_output(f"💡 Suggestion: {suggestion}")
+                    self.io.tool_output(f"\n💡 {suggestion}")
 
-                # Store issue context on the coder object so the auto-resolve
-                # (triggered on /commit) and manual /solved both have what they need.
+                if confidence is not None:
+                    # Only surface confidence when it's low — as a heads-up to the dev.
+                    if confidence < 0.60:
+                        self.io.tool_warning(
+                            f"   (Low confidence: {confidence:.0%}) — treat this as a starting point."
+                        )
+
+                # Store issue context for auto-resolve on /commit and manual /solved
                 if issue_id:
                     self.coder._nexus_last_issue_id = issue_id
                     self.coder._nexus_last_issue_description = error_description
                     self.coder._nexus_last_solve_suggestion = suggestion
-                    self.io.tool_output(
-                        "   Resolution will be recorded automatically when you /commit."
-                        " Or use /solved for a more detailed note."
-                    )
+                    if not cached:
+                        self.io.tool_output(
+                            "   Resolution will be recorded automatically when you /commit."
+                            " Or use /solved for a more detailed note."
+                        )
             else:
                 self.io.tool_error(f"Overflow API returned HTTP {resp.status_code}")
         except Exception as e:

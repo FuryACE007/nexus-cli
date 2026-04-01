@@ -1,0 +1,38 @@
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#ffffff',
+  'primaryTextColor': '#1a1a1a',
+  'primaryBorderColor': '#555',
+  'lineColor': '#555',
+  'edgeLabelBackground': '#ffffff',
+  'fontSize': '15px'
+}}}%%
+
+flowchart TD
+
+    subgraph KB["  💾 Knowledge Base  "]
+        direction LR
+        SK["📝 SKILL.md"]:::kb
+        CH["🔮 ChromaDB\npast fixes"]:::kb
+        CF["📄 Confluence\ndocs"]:::kb
+    end
+
+    KB -->|"RAG injected into\nevery request"| ARCH
+
+    AT["Developer types @skill name\nSwitch product context mid-session"]:::process
+    AT -->|"GET /api/skills/name\nUpdate X-Nexus-Skill header"| ARCH
+
+    DEV["💬 Developer message\nCLI or Chat UI"]:::input
+    DEV --> ARCH
+
+    ARCH["🧠 Architect Model\nnexus-architect\nPlans the change"]:::agent
+    ARCH -->|"plan"| EDITOR
+    EDITOR["✏️ Editor Model\nnexus-agent\nGenerates SEARCH/REPLACE blocks"]:::agent
+    EDITOR -->|"applies edits"| FILES["📁 Code changes\napplied to project"]:::success
+
+    classDef input    fill:#d6eaf8,stroke:#2980b9,color:#1a1a1a
+    classDef process  fill:#eaf4fb,stroke:#5dade2,color:#1a1a1a
+    classDef agent    fill:#d5f5e3,stroke:#27ae60,color:#1a1a1a,font-weight:bold
+    classDef success  fill:#d4efdf,stroke:#27ae60,color:#1a1a1a
+    classDef kb       fill:#fef9e7,stroke:#f39c12,color:#1a1a1a
+
+    style KB fill:#fef9e7,stroke:#f39c12,stroke-width:2px,color:#1a1a1a

@@ -191,7 +191,13 @@ async def get_skill(name: str, request: Request):
 
 @app.post("/api/overflow/ingest")
 async def overflow_ingest(request: Request):
-    """Receive error submissions"""
+    """Always return an answer. Internally simulates the semantic cache decision.
+
+    Decision tree (mirrors production backend):
+      similarity >= 0.87  → CACHE HIT  (return stored entry, don't persist)
+      0.65 <= sim < 0.87  → SIMILAR    (call LLM, don't persist)
+      sim < 0.65          → NOVEL      (call LLM, persist if confidence >= 0.72)
+    """
     global last_request
     body = await request.json()
     headers = dict(request.headers)
@@ -203,41 +209,156 @@ async def overflow_ingest(request: Request):
         "body": body,
     }
 
-    print(f"\n📨 Received POST /api/overflow/ingest")
-    print(f"   Description: {body.get('description', '')[:60]}")
-    print(f"   Git diff lines: {len(body.get('git_diff', '').splitlines())}")
-    print(f"   Files in context: {len(body.get('files_in_context', []))}")
-    print(f"   Skill: {headers.get('x-nexus-skill', 'not set')}")
+    description   = body.get("description", "")
+    git_diff      = body.get("git_diff", "")
+    all_files     = body.get("all_files", [])
+    chat_files    = body.get("chat_files", [])
+    ident_mentions = body.get("ident_mentions", [])
+    file_mentions  = body.get("file_mentions", [])
+    lint_outcome  = body.get("lint_outcome")
+    test_outcome  = body.get("test_outcome")
+    dirty_files   = body.get("dirty_files", [])
+    recent_commits = body.get("recent_commits", [])
 
-    # Assign a stable issue_id for this submission
-    issue_id = str(uuid.uuid4())
     skill = headers.get("x-nexus-skill", "unknown")
 
-    # Store in mock knowledge base
-    _overflow_issues[issue_id] = {
-        "description": body.get("description", ""),
-        "git_diff": body.get("git_diff", ""),
-        "files_in_context": body.get("files_in_context", []),
-        "skill": skill,
-        "resolution": None,
-    }
+    print(f"\n📨 Received POST /api/overflow/ingest")
+    print(f"   Description: {description[:80]}")
+    print(f"   Git diff lines: {len(git_diff.splitlines())}")
+    print(f"   All files: {len(all_files)}, Chat files: {len(chat_files)}")
+    print(f"   Ident mentions: {ident_mentions[:5]}")
+    print(f"   Dirty files: {dirty_files}")
+    print(f"   Lint: {lint_outcome}, Test: {test_outcome}")
+    print(f"   Skill: {skill}")
 
-    print(f"   Assigned issue_id: {issue_id}")
+    # ── Mock semantic cache lookup ──────────────────────────────────────────────
+    # In production this is a cosine similarity search against a vector store.
+    # Here we use keyword overlap as a cheap approximation.
+    def _mock_similarity(stored_desc: str, query_desc: str) -> float:
+        s_words = set(stored_desc.lower().split())
+        q_words = set(query_desc.lower().split())
+        if not s_words or not q_words:
+            return 0.0
+        overlap = len(s_words & q_words)
+        return overlap / max(len(s_words | q_words), 1)
 
-    # Mock: check if any resolved issues look similar (real backend uses vector search)
-    suggestion = ""
+    best_sim = 0.0
+    best_match = None
     for past_id, past in _overflow_issues.items():
-        if past_id != issue_id and past["resolution"] and past["skill"] == skill:
-            suggestion = f"Similar past issue resolved with: {past['resolution']}"
-            break
+        # Only searchable entries have expires_at (persisted to KB or enriched via /solved)
+        if "expires_at" not in past and past.get("resolution") is None:
+            continue
+        sim = _mock_similarity(past["description"], description)
+        if sim > best_sim:
+            best_sim = sim
+            best_match = (past_id, past)
 
-    if not suggestion:
-        suggestion = "This looks like an authentication timeout. Check your token refresh logic."
+    # ── Threshold routing ───────────────────────────────────────────────────────
+    CACHE_HIT_THRESHOLD  = 0.87   # serve cached, skip LLM
+    SIMILAR_THRESHOLD    = 0.65   # serve LLM answer, skip persistence
+    CONFIDENCE_THRESHOLD = 0.72   # minimum confidence to persist novel solutions
+    DEDUP_THRESHOLD      = 0.80   # dedup gate before storing
+
+    issue_id = str(uuid.uuid4())
+    cached   = False
+    persisted = False
+    confidence_score = None
+    cache_hit_similarity = None
+
+    if best_sim >= CACHE_HIT_THRESHOLD and best_match:
+        # ── CACHE HIT ──────────────────────────────────────────────────────────
+        cached = True
+        cache_hit_similarity = round(best_sim, 3)
+        past_id, past = best_match
+        suggestion = past.get("suggestion", "")
+        past["hit_count"] = past.get("hit_count", 0) + 1
+        # Reset TTL on each hit (6-month rolling window)
+        from datetime import datetime, timedelta
+        past["expires_at"] = (datetime.utcnow() + timedelta(days=180)).isoformat()
+        print(f"   ⚡ Cache hit (similarity={best_sim:.2f}) → issue {past_id}, TTL reset")
+    else:
+        # ── LLM PATH (mock) ────────────────────────────────────────────────────
+        # Build a grounded mock suggestion using the context the CLI sent.
+        context_clues = []
+        if ident_mentions:
+            context_clues.append(f"identifiers: {', '.join(ident_mentions[:3])}")
+        if chat_files:
+            context_clues.append(f"active files: {', '.join(chat_files[:3])}")
+        elif file_mentions:
+            context_clues.append(f"mentioned files: {', '.join(file_mentions[:3])}")
+        if dirty_files:
+            context_clues.append(f"dirty: {', '.join(dirty_files[:2])}")
+        if recent_commits:
+            context_clues.append(f"last commit: {recent_commits[0]}")
+
+        context_str = " | ".join(context_clues)
+        desc_preview = description[:60] + ("..." if len(description) > 60 else "")
+        base_suggestion = f'Based on your query ("{desc_preview}")'
+        if context_str:
+            base_suggestion += f" and context ({context_str})"
+        base_suggestion += (
+            ": check your token expiry logic and ensure the refresh call fires "
+            "before the expiry window, not after. Verify the middleware order in your "
+            "request pipeline."
+        )
+
+        # ── Compute mock confidence score ──────────────────────────────────────
+        score = 0.50
+        if len(base_suggestion.split()) > 80: score += 0.10
+        if len(all_files) > 5:               score += 0.05
+        if lint_outcome is True:             score += 0.05
+        if test_outcome is True:             score += 0.10
+        if test_outcome is False:            score -= 0.10
+        confidence_score = round(min(score, 1.0), 3)
+
+        suggestion = base_suggestion
+        novel = best_sim < SIMILAR_THRESHOLD
+        dedup_clear = best_sim < DEDUP_THRESHOLD
+
+        # ── Storage decision — fully automatic, no human in the loop ──────────
+        # Novel query + confident response + passes dedup gate → auto-persist
+        # with a flat 6-month TTL. No staging, no promotion steps.
+        if novel and dedup_clear and confidence_score >= CONFIDENCE_THRESHOLD:
+            persisted = True
+            from datetime import datetime, timedelta
+            expires_at = (datetime.utcnow() + timedelta(days=180)).isoformat()
+            _overflow_issues[issue_id] = {
+                "description": description,
+                "git_diff": git_diff,
+                "all_files": all_files,
+                "chat_files": chat_files,
+                "ident_mentions": ident_mentions,
+                "skill": skill,
+                "suggestion": suggestion,
+                "confidence": confidence_score,
+                "hit_count": 0,
+                "resolution": None,
+                "expires_at": expires_at,   # 6-month flat TTL, reset on each cache hit
+            }
+            print(f"   📚 Auto-persisted to KB (confidence={confidence_score:.2f}, sim={best_sim:.2f}, ttl=6mo)")
+        else:
+            reason = "similar_exists" if not novel else "dedup_blocked" if not dedup_clear else "low_confidence"
+            print(f"   ⏭️  Served but not persisted ({reason}, sim={best_sim:.2f}, conf={confidence_score:.2f})")
+            # Store a lightweight session entry so /solved can enrich if called.
+            # Not returned as a cache hit (no expires_at = not searchable).
+            _overflow_issues[issue_id] = {
+                "description": description,
+                "skill": skill,
+                "suggestion": suggestion,
+                "confidence": confidence_score,
+                "resolution": None,
+            }
+
+    print(f"   Returning issue_id={issue_id}, cached={cached}, persisted={persisted}")
 
     return {
-        "status": "ingested",
+        "status": "ok",
         "issue_id": issue_id,
-        "suggestion": suggestion,
+        "suggestion": suggestion if not cached else best_match[1].get("suggestion", ""),
+        "cached": cached,
+        "cache_hit_similarity": cache_hit_similarity,
+        "confidence_score": confidence_score,
+        "persisted": persisted,
     }
 
 
@@ -325,8 +446,15 @@ async def overflow_resolve(request: Request):
         source = "LLM summary of committed diff"
 
     _overflow_issues[issue_id]["resolution"] = final_resolution
-    resolved_count = sum(1 for v in _overflow_issues.values() if v["resolution"])
-    print(f"   ✅ Resolution stored via {source}")
+    # Enriched entries become (or remain) searchable — set/reset the 6-month TTL.
+    # This upgrades a previously served-only session entry into a KB entry.
+    from datetime import datetime, timedelta
+    _overflow_issues[issue_id]["expires_at"] = (datetime.utcnow() + timedelta(days=180)).isoformat()
+    # Update the suggestion to reflect the real fix (better cache quality for future hits)
+    _overflow_issues[issue_id]["suggestion"] = final_resolution
+
+    resolved_count = sum(1 for v in _overflow_issues.values() if v.get("resolution"))
+    print(f"   ✅ Resolution stored via {source}, entry now searchable (TTL=6mo)")
     print(f"   Knowledge base: {resolved_count} resolved issue(s)")
 
     return {

@@ -31,10 +31,12 @@
 │     ├─ Product metadata + keywords (for auto-detection)     │
 │     └─ Full SKILLS.md content (for context injection)       │
 │                                                              │
-│  3. AgentOverflow Knowledge Base                            │
-│     ├─ /api/overflow/ingest  — store issue + return id     │
-│     │   └─ similarity search → surface past resolutions    │
-│     └─ /api/overflow/resolve — attach confirmed fix to id  │
+│  3. AgentOverflow Semantic Cache                            │
+│     ├─ /api/overflow/ingest  — always answers immediately  │
+│     │   ├─ similarity ≥ 0.87 → cache hit (skip LLM)       │
+│     │   ├─ 0.65-0.87 → LLM call, skip persist             │
+│     │   └─ < 0.65 → LLM call, auto-persist if conf≥0.72  │
+│     └─ /api/overflow/resolve — enrich entry w/ real fix   │
 │                                                              │
 └────────────────────────┬────────────────────────────────────┘
                          │
@@ -362,35 +364,51 @@ Stage 2 — CLI automatically sends (after user confirms "Edit the files?"):
 
 ### 4. POST /api/overflow/ingest
 
-**Purpose**: Receive error/debugging submissions from the `/solve` CLI command; run similarity
-search to surface any past confirmed resolutions; return an `issue_id` so the developer can
-later call `/solved` to close the loop.
+**Purpose**: Receive a developer query from `/solve` and **always return an answer immediately**.
+The backend runs a semantic cache decision automatically — no human approval or staging required.
 
-**Request Headers**: `X-Nexus-Skill` (optional): Scopes similarity search to the same product
+**Semantic cache decision** (fully automated):
+- `similarity ≥ 0.87` → CACHE HIT: return stored answer, `cached=true`
+- `0.65 ≤ sim < 0.87` → SIMILAR: call LLM, return answer, `persisted=false`
+- `sim < 0.65` → NOVEL: call LLM, if `confidence ≥ 0.72` → auto-persist (`persisted=true`)
 
-**Request Body**:
+**Request Headers**: `X-Nexus-Skill` (optional): Scopes the similarity search to the same product
+
+**Request Body** (rich context from CLI):
 ```json
 {
-  "description": "Auth middleware returns 403 after token refresh",
-  "git_diff": "diff --git a/auth.py b/auth.py\n...",
-  "files_in_context": ["src/auth.py", "src/middleware.py", "tests/auth_test.py"]
+  "description":    "Auth middleware returns 403 after token refresh",
+  "git_diff":       "diff --git a/auth.py b/auth.py\n...",
+  "dirty_files":    ["src/auth.py"],
+  "recent_commits": ["fix: token refresh", "chore: bump deps"],
+  "all_files":      ["src/auth.py", "src/middleware.py", "tests/test_auth.py"],
+  "chat_files":     ["src/auth.py"],
+  "ident_mentions": ["refresh_token", "AuthMiddleware"],
+  "file_mentions":  ["auth.py"],
+  "lint_outcome":   null,
+  "test_outcome":   false,
+  "recent_messages": [{"role": "user", "content": "..."}]
 }
 ```
 
 **Response** (200):
 ```json
 {
-  "status": "ingested",
+  "status": "ok",
   "issue_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "suggestion": "Similar past issue resolved with: Moving token refresh before auth check fixed the 403s."
+  "suggestion": "The token expiry check runs before the refresh call on line 47...",
+  "cached": false,
+  "cache_hit_similarity": null,
+  "confidence_score": 0.82,
+  "persisted": true
 }
 ```
 
-**`issue_id`**: The CLI stores this on the coder object (`_nexus_last_issue_id`). When the
-developer runs `/solved <explanation>`, the CLI sends `issue_id + resolution` to the resolve
-endpoint to permanently attach the confirmed fix to this issue record.
+**`issue_id`**: The CLI stores this on the coder object (`_nexus_last_issue_id`). Used for auto-resolve on `/commit` and manual `/solved`. The `issue_id` references the session entry whether or not it was persisted.
 
-**`suggestion`**: May be empty string if no close match was found in the knowledge base.
+**`suggestion`**: Always populated — either the cached answer (similarity ≥ 0.87) or the fresh LLM response. Never an empty string.
+
+**`confidence_score`**: If < 0.60, the CLI surfaces a low-confidence warning to the developer.
 
 **Used By**: CLI `/solve` command
 
@@ -398,8 +416,9 @@ endpoint to permanently attach the confirmed fix to this issue record.
 
 ### 5. POST /api/overflow/resolve
 
-**Purpose**: Close the loop on a submitted issue by capturing what code actually changed.
-This is what populates the knowledge base — nothing is searchable until this is called.
+**Purpose**: Enrich a previously answered issue with the real committed fix. If the entry was
+auto-persisted at ingest, it is **upgraded** in ChromaDB (AI answer → confirmed fix). If it
+was session-only, it now becomes searchable for the first time with a 6-month TTL.
 
 **Key design**: The CLI never asks the developer to write a description. Instead, it captures
 `git show HEAD` at commit time and sends the raw diff. **The backend summarizes it via LLM.**
@@ -473,32 +492,51 @@ After success, the CLI clears `_nexus_last_issue_id` to prevent stale re-use.
 
 ## AgentOverflow: Knowledge Base Design
 
-AgentOverflow is the nexus-cli's developer knowledge system. It transforms each debugging
-session into a permanent, searchable record so that the next developer who hits the same
-error gets an immediate, battle-tested fix — without needing to ask the LLM to rediscover it.
+AgentOverflow is the nexus-cli's developer knowledge system. It uses a **semantic cache**
+to answer every `/solve` query instantly — either from the knowledge base (cache hit) or via
+the LLM (cache miss). Confident, novel answers are automatically persisted with a 6-month
+TTL. No human approval or staging area is required at any point.
 
 ### Lifecycle of an Issue
 
-The key design principle: **developers provide zero extra input.** The resolution is
-captured automatically from the git diff at commit time, not from a text field the
-developer has to fill in. The backend uses the LLM to turn that diff into a meaningful
-summary, so the knowledge base always contains human-readable entries.
+The key design principle: **developers provide zero extra input.** The backend decides
+automatically what to cache; resolution is captured automatically from the git diff at
+commit time if the developer does nothing, or from an explicit `/solved` note if they choose.
 
 ```
 Developer types:    /solve Auth returns 403 after token refresh
                               │
                               ▼
-CLI collects:       description + git diff (current state) + files_in_context
+CLI collects:       description + rich context (git diff, all_files, chat_files,
+                    ident_mentions, file_mentions, lint/test outcomes, recent messages)
                               │
                               ▼
-POST /api/overflow/ingest ────► backend assigns issue_id
-                              │   ├─ embeds description
-                              │   ├─ similarity search → top-K resolved issues
-                              │   ├─ returns issue_id + suggestion (empty if no match)
-                              │   └─ stores PENDING issue in DB (not searchable yet)
+POST /api/overflow/ingest ────► backend runs SEMANTIC CACHE DECISION:
                               │
-                    CLI prints suggestion, stores issue_id internally
-                    Developer tries the fix (using suggestion or their own approach)
+                              ├─ similarity ≥ 0.87  →  CACHE HIT
+                              │     return stored answer instantly (no LLM call)
+                              │     cached=true, persisted=false
+                              │
+                              ├─ 0.65 ≤ sim < 0.87  →  SIMILAR EXISTS
+                              │     call LLM with similar entry as context
+                              │     return answer, skip persist (dedup protection)
+                              │     cached=false, persisted=false
+                              │
+                              └─ sim < 0.65  →  NOVEL QUERY
+                                    call LLM (RAG + ranked file context)
+                                    compute confidence score
+                                    │
+                                    ├─ confidence ≥ 0.72  →  AUTO-PERSIST
+                                    │     store question + AI answer in vector DB
+                                    │     6-month TTL, reset on each future cache hit
+                                    │     cached=false, persisted=true
+                                    │
+                                    └─ confidence < 0.72  →  SERVE ONLY
+                                          answer returned, nothing stored
+                                          cached=false, persisted=false
+
+                    CLI always prints the suggestion immediately.
+                    Developer fixes the issue using suggestion or their own approach.
                               │
                     Developer types /commit  ← only thing they do
                               │
@@ -509,14 +547,20 @@ CLI auto-captures:  git show HEAD  (the committed diff — what actually changed
 POST /api/overflow/resolve ───► backend receives committed_diff
                                   ├─ calls LLM: "explain this fix in 1-2 sentences"
                                   │   given: original issue description + diff
-                                  ├─ stores LLM-generated resolution text
-                                  ├─ re-embeds (description + resolution) together
-                                  ├─ upserts to vector index → NOW searchable
-                                  └─ marks issue as resolved_at = now()
+                                  ├─ replaces AI answer with real-world fix in vector DB
+                                  ├─ re-embeds (description + confirmed resolution)
+                                  └─ resets TTL to 6 months from now
 
                     CLI prints one line: "📚 AgentOverflow: fix captured."
                     Developer sees nothing else. Zero extra steps.
 ```
+
+**Why auto-persist at /solve time rather than waiting for /solved?**
+Waiting for a confirmed resolution creates a chicken-and-egg problem: the cache is empty
+until developers manually close loops, which they rarely do consistently. Auto-persisting
+on confidence (≥ 0.72) means the KB populates from day one. The `/solved` path then enriches
+entries that already exist — replacing AI speculation with real committed code. This gives
+you both immediate utility and progressive quality improvement over time.
 
 **Why the diff, not the commit message?**
 Commit messages are almost never useful for a knowledge base — "fix", "wip", "changes",
@@ -529,25 +573,26 @@ Combined with the original issue description, the LLM can always produce a meani
 
 The backend already uses **ChromaDB** as its vector store. The AgentOverflow knowledge base
 maps directly onto this: ChromaDB handles the embeddings and similarity search; your existing
-SQLite database holds the raw records, diffs, and timestamps for
-structured queries.
+SQLite database holds the raw records, diffs, and timestamps for structured queries.
 
 **Two-store pattern:**
 
 ```
-SQLite DB                        ChromaDB collection
-─────────────────────────        ──────────────────────────────────
-overflow_issues table            "overflow_resolutions" collection
-  id, skill, description,          One document per RESOLVED issue
-  solve_diff, committed_diff,       document = "Issue: ...\nResolution: ..."
-  files, resolution,                metadata = {skill, issue_id, resolved_at}
-  created_at, resolved_at           id = issue_id (same UUID)
+SQLite DB                          ChromaDB collection
+─────────────────────────          ──────────────────────────────────────
+overflow_issues table              "overflow_cache" collection
+  id, skill, description,            One document per PERSISTED entry
+  all_files, chat_files,             (auto-persisted at /solve OR enriched at /solved)
+  solve_diff, committed_diff,        document = "Issue: ...\nAnswer/Resolution: ..."
+  suggestion, resolution,            metadata = {skill, issue_id, expires_at}
+  confidence, hit_count,             id = issue_id (same UUID)
+  created_at, expires_at
 ```
 
-SQLite is the source of truth for all records (resolved and pending).
-ChromaDB contains **only resolved issues** — it is purely a search index.
-When you need to look up a raw diff or check when an issue was submitted,
-query SQLite. When you need "find me the 3 most similar past fixes", query ChromaDB.
+SQLite is the source of truth for all records.
+ChromaDB contains **persisted entries** — entries where the backend decided to cache the
+answer (auto-persisted at ingest) or entries subsequently enriched via `/solved`.
+Session-only entries (served but not persisted) exist only in SQLite for `/solved` tracking.
 
 **Relational schema (SQLite):**
 
@@ -556,12 +601,19 @@ CREATE TABLE IF NOT EXISTS overflow_issues (
     id              TEXT PRIMARY KEY,        -- UUID generated in Python: str(uuid.uuid4())
     skill           TEXT NOT NULL,
     description     TEXT NOT NULL,           -- developer's /solve message
+    all_files       TEXT,                    -- JSON: coder.get_all_relative_files()
+    chat_files      TEXT,                    -- JSON: explicitly /add'd files
+    ident_mentions  TEXT,                    -- JSON: identifiers from description
+    file_mentions   TEXT,                    -- JSON: filenames from description
     solve_diff      TEXT,                    -- git diff at /solve time
     committed_diff  TEXT,                    -- git show HEAD captured at /commit
-    files           TEXT,                    -- JSON-encoded list: json.dumps(files_list)
-    resolution      TEXT,                    -- LLM-generated or explicit text; NULL = pending
+    suggestion      TEXT,                    -- AI answer (may be replaced by resolution)
+    resolution      TEXT,                    -- confirmed fix (NULL = not yet enriched)
+    confidence      REAL,                    -- LLM confidence 0-1 at ingest time
+    hit_count       INTEGER DEFAULT 0,       -- cache hit count (for analytics)
+    persisted       INTEGER DEFAULT 0,       -- 1 = in ChromaDB, 0 = session-only
     created_at      TEXT DEFAULT (datetime('now')),
-    resolved_at     TEXT                     -- NULL = pending (not in ChromaDB yet)
+    expires_at      TEXT                     -- 6-month flat TTL, NULL = session-only (not in ChromaDB)
 );
 ```
 
@@ -583,7 +635,7 @@ chroma_client = chromadb.PersistentClient(path="./chroma_data")
 # One collection for all AgentOverflow resolutions
 # cosine distance is best for semantic text similarity
 overflow_collection = chroma_client.get_or_create_collection(
-    name="overflow_resolutions",
+    name="overflow_cache",
     metadata={"hnsw:space": "cosine"},
 )
 ```
@@ -595,12 +647,13 @@ works well for code-related text.
 
 ### Ingest Flow (POST /api/overflow/ingest)
 
-At ingest time, only SQLite is written to. The issue is not added to ChromaDB yet —
-it stays invisible to similarity search until it has a confirmed resolution.
+At ingest time, the backend runs the semantic cache decision and **always returns an answer
+immediately**. If the answer is confident and novel, it is auto-persisted to ChromaDB with
+a 6-month TTL — no human approval or staging step required.
 
 ```python
 import sqlite3, uuid, json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Open (or create) the SQLite database — one file, zero extra infrastructure
 db = sqlite3.connect("nexus_overflow.db", check_same_thread=False)
@@ -608,35 +661,130 @@ db.row_factory = sqlite3.Row   # lets you access columns by name: row["descripti
 db.execute("""
     CREATE TABLE IF NOT EXISTS overflow_issues (
         id TEXT PRIMARY KEY, skill TEXT NOT NULL, description TEXT NOT NULL,
-        solve_diff TEXT, committed_diff TEXT, files TEXT,
-        resolution TEXT, created_at TEXT DEFAULT (datetime('now')), resolved_at TEXT
+        all_files TEXT, chat_files TEXT, ident_mentions TEXT, file_mentions TEXT,
+        solve_diff TEXT, committed_diff TEXT, suggestion TEXT, resolution TEXT,
+        confidence REAL, hit_count INTEGER DEFAULT 0, persisted INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')), expires_at TEXT
     )
 """)
 db.commit()
 
 
-def handle_ingest(description: str, git_diff: str, files: list, skill: str) -> dict:
+CACHE_HIT_THRESHOLD  = 0.87   # return cached answer, skip LLM
+SIMILAR_THRESHOLD    = 0.65   # call LLM but skip persist (dedup protection)
+CONFIDENCE_THRESHOLD = 0.72   # minimum confidence to auto-persist novel answers
+DEDUP_THRESHOLD      = 0.80   # secondary dedup gate before storing
+TTL_DAYS             = 180    # flat 6-month TTL for all persisted entries
+
+
+def handle_ingest(body: dict, skill: str) -> dict:
+    description    = body["description"]
+    git_diff       = body.get("git_diff", "")
+    all_files      = body.get("all_files", [])
+    chat_files     = body.get("chat_files", [])
+    ident_mentions = body.get("ident_mentions", [])
+    file_mentions  = body.get("file_mentions", [])
+    lint_outcome   = body.get("lint_outcome")
+    test_outcome   = body.get("test_outcome")
+
     issue_id = str(uuid.uuid4())
 
-    # 1. Persist raw record in SQLite (pending — not in ChromaDB yet)
-    db.execute(
-        "INSERT INTO overflow_issues (id, skill, description, solve_diff, files) VALUES (?,?,?,?,?)",
-        (issue_id, skill, description, git_diff, json.dumps(files)),
-    )
-    db.commit()
+    # ── 1. Embed description (+ ident_mentions as boosting context) ────────────
+    query_text = description
+    if ident_mentions:
+        query_text += " " + " ".join(ident_mentions[:5])
 
-    # 2. Query ChromaDB for similar RESOLVED issues to surface an immediate suggestion
-    #    ChromaDB only contains resolved issues, so no extra filter is needed here
-    suggestions = search_overflow(query=description, skill=skill, limit=1)
-    suggestion_text = suggestions[0]["resolution"] if suggestions else ""
+    # ── 2. Similarity search against ChromaDB (persisted entries only) ─────────
+    similar = search_overflow(query=query_text, skill=skill, limit=1)
+    best_sim = similar[0]["score"] if similar else 0.0
+    cached = False
+    persisted = False
+    confidence_score = None
+    cache_hit_similarity = None
 
-    return {"status": "ingested", "issue_id": issue_id, "suggestion": suggestion_text}
+    if best_sim >= CACHE_HIT_THRESHOLD:
+        # ── CACHE HIT ──────────────────────────────────────────────────────────
+        cached = True
+        cache_hit_similarity = round(best_sim, 3)
+        suggestion = similar[0]["suggestion"]
+        # Update hit count and reset TTL in SQLite + ChromaDB
+        db.execute(
+            "UPDATE overflow_issues SET hit_count = hit_count + 1, expires_at = ? WHERE description = ?",
+            ((datetime.utcnow() + timedelta(days=TTL_DAYS)).isoformat(), similar[0]["description"])
+        )
+        db.commit()
+    else:
+        # ── LLM PATH ───────────────────────────────────────────────────────────
+        # Rank files by relevance (chat_files → 50× boost, ident/file mentions → 10×)
+        ranked_files = rank_by_relevance(all_files, chat_files, ident_mentions, file_mentions)
+
+        # Retrieve top KB entries as RAG context
+        kb_entries = search_overflow(query=query_text, skill=skill, limit=3, min_score=0.55)
+
+        # Build LLM prompt with enriched context
+        suggestion = call_llm_with_rag(description, ranked_files, kb_entries, skill)
+
+        # ── Confidence signal ─────────────────────────────────────────────────
+        confidence_score = compute_confidence(suggestion, lint_outcome, test_outcome)
+
+        novel = best_sim < SIMILAR_THRESHOLD
+        dedup_clear = best_sim < DEDUP_THRESHOLD  # secondary check before storing
+
+        if novel and dedup_clear and confidence_score >= CONFIDENCE_THRESHOLD:
+            # AUTO-PERSIST: no human approval required
+            persisted = True
+            expires_at = (datetime.utcnow() + timedelta(days=TTL_DAYS)).isoformat()
+
+            # Store in SQLite (source of truth)
+            db.execute(
+                """INSERT INTO overflow_issues
+                   (id, skill, description, all_files, chat_files, ident_mentions,
+                    file_mentions, solve_diff, suggestion, confidence, persisted, expires_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,1,?)""",
+                (issue_id, skill, description,
+                 json.dumps(all_files), json.dumps(chat_files),
+                 json.dumps(ident_mentions), json.dumps(file_mentions),
+                 git_diff, suggestion, confidence_score, expires_at),
+            )
+            db.commit()
+
+            # Add to ChromaDB (now searchable)
+            doc_text = f"Issue: {description}\nAnswer: {suggestion}"
+            overflow_collection.upsert(
+                ids=[issue_id],
+                documents=[doc_text],
+                metadatas=[{"skill": skill, "description": description,
+                             "suggestion": suggestion, "expires_at": expires_at}],
+            )
+        else:
+            # SESSION-ONLY: serve the answer, don't cache
+            db.execute(
+                """INSERT INTO overflow_issues
+                   (id, skill, description, solve_diff, suggestion, confidence, persisted)
+                   VALUES (?,?,?,?,?,?,0)""",
+                (issue_id, skill, description, git_diff, suggestion, confidence_score),
+            )
+            db.commit()
+            # Not added to ChromaDB — may be enriched via /solved later
+
+    return {
+        "status": "ok",
+        "issue_id": issue_id,
+        "suggestion": suggestion,
+        "cached": cached,
+        "cache_hit_similarity": cache_hit_similarity,
+        "confidence_score": confidence_score,
+        "persisted": persisted,
+    }
 ```
 
 ### Resolve Flow (POST /api/overflow/resolve)
 
-This is where the LLM earns its keep. The committed diff comes in, the LLM summarizes
-it, and only then does the record enter ChromaDB and become searchable.
+This is where real-world confirmation enriches the knowledge base. The committed diff
+comes in, the LLM summarizes it, and the stored entry is **upgraded** — replacing the
+original AI answer with a team-verified fix. If the entry was already in ChromaDB
+(auto-persisted at ingest), it is updated in-place. If it was session-only, it now
+becomes searchable for the first time.
 
 ```python
 async def generate_resolution_summary(description: str, committed_diff: str) -> str:
@@ -689,8 +837,18 @@ def handle_resolve(issue_id: str, committed_diff: str = None, resolution: str = 
     """, (final_resolution, committed_diff, issue_id))
     db.commit()
 
-    # Add to ChromaDB — NOW it becomes searchable
-    # The document text combines issue + resolution so future queries on either side match
+    # Update SQLite — set resolution, committed_diff, expires_at (reset TTL), mark persisted
+    new_expires_at = (datetime.utcnow() + timedelta(days=TTL_DAYS)).isoformat()
+    db.execute("""
+        UPDATE overflow_issues
+        SET resolution = ?, committed_diff = ?, suggestion = ?, persisted = 1,
+            expires_at = ?
+        WHERE id = ?
+    """, (final_resolution, committed_diff, final_resolution, new_expires_at, issue_id))
+    db.commit()
+
+    # Upsert to ChromaDB — enriched document with confirmed fix replaces AI speculation.
+    # `upsert` handles both cases: entry already in ChromaDB (update) or new (insert).
     doc_text = f"Issue: {row['description']}\nResolution: {final_resolution}"
     overflow_collection.upsert(
         ids=[issue_id],
@@ -698,13 +856,16 @@ def handle_resolve(issue_id: str, committed_diff: str = None, resolution: str = 
         metadatas=[{
             "skill": row["skill"],
             "description": row["description"],
-            "resolution": final_resolution,
+            "suggestion": final_resolution,
+            "expires_at": new_expires_at,
         }],
     )
 ```
 
 **Why `upsert` instead of `add`?** If `/solved` is called twice for the same issue (e.g.
 the developer refines their note), `upsert` replaces the existing document cleanly.
+It also handles the case where the entry was already in ChromaDB from auto-persist at
+ingest — `upsert` upgrades it with the real fix.
 
 **Why combine description + resolution as one document string?** ChromaDB embeds the
 `document` field. Future ingest queries come in as issue descriptions — e.g. "getting 403
@@ -775,10 +936,12 @@ Confluence — giving it grounded, product-specific answers instead of generic a
 
 The CLI has no vector DB, no embedding logic, and no knowledge storage. It only:
 
-1. Sends `POST /api/overflow/ingest` with description + context → gets back `issue_id + suggestion`
+1. Sends `POST /api/overflow/ingest` with rich context (description, git_diff, all_files, chat_files, ident_mentions, file_mentions, lint/test outcomes, recent messages) → gets back `{issue_id, suggestion, cached, confidence_score, persisted}`
 2. Stores `issue_id` on the coder object (`self.coder._nexus_last_issue_id`)
-3. Sends `POST /api/overflow/resolve` with `issue_id + resolution` → gets back confirmation
-4. Clears the stored `issue_id` after a successful `/solved` call
+3. Sends `POST /api/overflow/resolve` with `issue_id + committed_diff` (auto on /commit) or `issue_id + resolution` (manual /solved) → gets back confirmation
+4. Clears the stored `issue_id` after a successful resolve call
+
+All embedding, similarity search, LLM calls, confidence scoring, and storage decisions are the **backend's responsibility**. The CLI never knows or cares whether a response was cached or freshly generated — it just shows the suggestion.
 
 All embedding, search, and storage is the backend's responsibility.
 
@@ -815,20 +978,23 @@ All embedding, search, and storage is the backend's responsibility.
 
 ### AgentOverflow Knowledge Base
 
-- [ ] Create `overflow_issues` table in SQLite (schema in KB Design section above)
-- [ ] Create ChromaDB `overflow_resolutions` collection with `{"hnsw:space": "cosine"}`
+- [ ] Create `overflow_issues` table in SQLite (schema in KB Design section above — includes `all_files`, `chat_files`, `ident_mentions`, `file_mentions`, `confidence`, `hit_count`, `persisted`, `expires_at`)
+- [ ] Create ChromaDB `overflow_cache` collection with `{"hnsw:space": "cosine"}`
 - [ ] `POST /api/overflow/ingest`:
-  - [ ] Accept `description`, `git_diff`, `files_in_context`
-  - [ ] Assign a UUID `issue_id` with `str(uuid.uuid4())`, persist as pending record in SQLite only
-  - [ ] Query ChromaDB `overflow_resolutions` with `where={"skill": skill}` for suggestions
-  - [ ] Return `{ status, issue_id, suggestion }` — suggestion empty string if no match
+  - [ ] Accept all rich context fields: `description`, `git_diff`, `dirty_files`, `recent_commits`, `all_files`, `chat_files`, `ident_mentions`, `file_mentions`, `lint_outcome`, `test_outcome`, `recent_messages`
+  - [ ] Embed `description` (+ `ident_mentions` as boosting context)
+  - [ ] Run similarity search: ≥ 0.87 = cache hit, 0.65-0.87 = similar (serve, skip persist), < 0.65 = novel
+  - [ ] For LLM calls: rank files by relevance (chat_files 50×, ident/file mentions 10×), inject as RAG
+  - [ ] Compute confidence score from response length, code blocks, test/lint outcome
+  - [ ] Auto-persist novel + confident (≥ 0.72) answers: upsert to ChromaDB + SQLite with 6-month TTL
+  - [ ] Return `{ status, issue_id, suggestion, cached, cache_hit_similarity, confidence_score, persisted }`
 - [ ] `POST /api/overflow/resolve`:
   - [ ] Look up `issue_id` in SQLite; return 404 if not found
   - [ ] If `resolution` present: use it directly
   - [ ] If only `committed_diff` present: call LLM to summarize → use as `resolution`
   - [ ] If neither: return 422
-  - [ ] Update SQLite: set `resolution`, `committed_diff`, `resolved_at = datetime('now')`
-  - [ ] `overflow_collection.upsert(id=issue_id, document="Issue: ...\nResolution: ...", metadata={skill, ...})`
+  - [ ] Update SQLite: set `resolution`, `committed_diff`, `persisted=1`, reset `expires_at` to +6 months
+  - [ ] `overflow_collection.upsert(id=issue_id, document="Issue: ...\nResolution: ...", metadata={skill, expires_at, ...})`
   - [ ] Return `{ status: "resolved", message }`
 - [ ] At chat time (`/v1/chat/completions`), call `search_overflow()` and inject results into `messages[1]`
 
@@ -972,8 +1138,8 @@ curl http://localhost:8000/api/skills/staking
 curl -X POST http://localhost:8000/api/overflow/ingest \
   -H "Content-Type: application/json" \
   -H "X-Nexus-Skill: staking" \
-  -d '{"description":"Auth 403 after token refresh","git_diff":"","files_in_context":["src/auth.py"]}'
-# → {"status":"ingested","issue_id":"<uuid>","suggestion":"..."}
+  -d '{"description":"Auth 403 after token refresh","git_diff":"","all_files":["src/auth.py","src/middleware.py"],"chat_files":["src/auth.py"],"ident_mentions":["AuthMiddleware"],"file_mentions":["auth.py"]}'
+# → {"status":"ok","issue_id":"<uuid>","suggestion":"...","cached":false,"confidence_score":0.82,"persisted":true}
 
 # Record the confirmed fix (use the issue_id from above)
 curl -X POST http://localhost:8000/api/overflow/resolve \

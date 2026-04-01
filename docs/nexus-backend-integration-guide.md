@@ -237,24 +237,152 @@ The `keywords` array is used by the CLI to auto-match against repository metadat
 
 ### 4. `POST /api/overflow/ingest`
 
-**Purpose**: Receive error/issue submissions from `/solve` command
+**Purpose**: Receive a developer query from `/solve` and **always return an answer immediately**. Internally the backend applies a semantic cache decision — no human approval or staging is required at any point. The developer never waits for or is aware of this decision.
 
-**Request Body**:
+#### Request Body
+
 ```json
 {
-  "description": "Auth middleware returns 403 after token refresh",
-  "git_diff": "diff --git a/auth.py b/auth.py\n...",
-  "files_in_context": ["src/auth.py", "src/middleware.py"]
+  "description":    "Auth middleware returns 403 after token refresh",
+
+  "git_diff":       "diff --git a/auth.py b/auth.py\n...",
+  "dirty_files":    ["src/auth.py"],
+  "recent_commits": ["fix: token refresh", "chore: bump deps"],
+
+  "all_files":      ["src/auth.py", "src/middleware.py", "tests/test_auth.py"],
+  "chat_files":     ["src/auth.py"],
+  "ident_mentions": ["refresh_token", "AuthMiddleware"],
+  "file_mentions":  ["auth.py"],
+
+  "lint_outcome":   null,
+  "test_outcome":   false,
+
+  "recent_messages": [
+    {"role": "user", "content": "The refresh endpoint keeps 403-ing"},
+    {"role": "assistant", "content": "..."}
+  ]
 }
 ```
 
-**Response**:
+Field notes:
+
+| Field | Source | Notes |
+|---|---|---|
+| `description` | user text | Primary embedding input for similarity search |
+| `git_diff` | `repo.get_diffs()` | May be empty — never block on this |
+| `dirty_files` | `repo.get_dirty_files()` | Files modified since last commit |
+| `recent_commits` | `git log --oneline -5` | Temporal context |
+| `all_files` | `coder.get_all_relative_files()` | Full git-tracked codebase (mirrors aider repo-map universe) |
+| `chat_files` | `coder.get_inchat_relative_files()` | Explicitly `/add`'d files — 50× PageRank boost in aider |
+| `ident_mentions` | `coder.get_ident_mentions(description)` | Identifiers extracted from user text |
+| `file_mentions` | `coder.get_file_mentions(description)` | Filenames extracted from user text |
+| `lint_outcome` | `coder.lint_outcome` | `null`=not run, `true`=pass, `false`=fail |
+| `test_outcome` | `coder.test_outcome` | Same |
+| `recent_messages` | `coder.done_messages[-6:]` | Last 3 conversation turns for retry context |
+
+#### Semantic Cache Decision Tree (Backend Logic)
+
+```
+RECEIVE query
+    │
+    ▼
+EMBED description  (+ ident_mentions as boosting context)
+    │
+    ▼
+COSINE SIMILARITY SEARCH against existing KB solutions
+    │
+    ├─ similarity ≥ 0.87  ──► CACHE HIT
+    │                          Return stored solution immediately
+    │                          cached=true, persisted=false
+    │
+    ├─ 0.65 ≤ similarity < 0.87  ──► SIMILAR EXISTS
+    │                               Call LLM (RAG + context injection)
+    │                               DEDUP FLAG set (do not store even if confident)
+    │                               cached=false, persisted=false
+    │
+    └─ similarity < 0.65  ──► NOVEL QUERY
+                               Call LLM (RAG + context injection)
+                               Compute confidence signal from response
+                               │
+                               ├─ confidence ≥ 0.72 AND response_length > 80 tokens
+                               │   AND test_outcome != false   ──► PERSIST TO KB
+                               │   cached=false, persisted=true
+                               │
+                               └─ otherwise  ──► SERVE ONLY
+                                   cached=false, persisted=false
+```
+
+#### RAG Context Injection for LLM Call
+
+When an LLM call is needed, build context from the request fields:
+
+```python
+# Rank files by relevance signal (mirrors aider's repo-map PageRank logic)
+# chat_files → 50× boost, ident_mentions / file_mentions → 10× boost
+ranked_files = rank_by_relevance(all_files, chat_files, ident_mentions, file_mentions)
+
+# Retrieve top matching KB entries for the query
+kb_entries = vector_search(description, top_k=5, threshold=0.55)
+
+# Inject as RAG system message (after aider's system prompt — same pattern as /chat)
+rag_context = build_rag_message(kb_entries, skill_content, ranked_files[:20])
+```
+
+#### Confidence Signal
+
+After the LLM responds, compute a confidence score used in the storage decision:
+
+```python
+def compute_confidence(response_text, lint_outcome, test_outcome):
+    score = 0.5   # base
+
+    # Response length: longer answers tend to be more actionable
+    tokens = len(response_text.split())
+    if tokens > 200:  score += 0.15
+    elif tokens > 80: score += 0.10
+
+    # Contains code (SEARCH/REPLACE blocks or inline code)
+    if "<<<<<<< SEARCH" in response_text or "```" in response_text:
+        score += 0.15
+
+    # Test/lint outcome: passing = higher signal that context was good
+    if test_outcome is True:   score += 0.10
+    if lint_outcome is True:   score += 0.05
+    if test_outcome is False:  score -= 0.10  # environment broken, lower trust
+
+    return min(score, 1.0)
+```
+
+#### TTL and Deduplication Strategy
+
+- **TTL**: All persisted entries have a flat **6-month TTL**, reset on each cache hit.
+- **Deduplication gate**: Before storing any new solution, run a final similarity check at threshold 0.80. If a match exists, update that entry's `hit_count` instead of creating a duplicate.
+- **No staging area**: Decisions are made automatically at ingest time. If the LLM response is confident enough, it is cached immediately — no human approval or secondary promote step is required.
+- **Enrichment on resolution**: When a developer later calls `/solved` or `/commit`, the stored entry is enriched with the real committed diff + LLM-generated summary, replacing the original AI answer. This improves future retrieval quality without changing when the entry became searchable.
+
+#### Response
+
 ```json
 {
-  "status": "ingested",
-  "suggestion": "Optional immediate debugging suggestion"
+  "status": "ok",
+  "issue_id": "3f7a2b1c-...",
+  "suggestion": "The token expiry check runs before the refresh call on line 47...",
+  "cached": false,
+  "cache_hit_similarity": null,
+  "confidence_score": 0.82,
+  "persisted": true
 }
 ```
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | string | `"ok"` or `"error"` |
+| `issue_id` | string | UUID for /solved resolution |
+| `suggestion` | string | The solution text shown to the developer |
+| `cached` | bool | `true` = served from KB cache |
+| `cache_hit_similarity` | float\|null | Cosine score of matched entry (null if not cached) |
+| `confidence_score` | float\|null | Model confidence 0–1 (null if cached) |
+| `persisted` | bool | `true` = new entry stored in KB |
 
 ### 5. `GET /v1/models`
 
@@ -321,8 +449,39 @@ async def get_skill(name: str, request: Request):
 @app.post("/api/overflow/ingest")
 async def overflow_ingest(request: Request):
     body = await request.json()
-    # TODO: Store/analyze the error submission
-    return {"status": "ingested", "suggestion": ""}
+    description    = body.get("description", "")
+    git_diff       = body.get("git_diff", "")
+    dirty_files    = body.get("dirty_files", [])
+    recent_commits = body.get("recent_commits", [])
+    all_files      = body.get("all_files", [])
+    chat_files     = body.get("chat_files", [])
+    ident_mentions = body.get("ident_mentions", [])
+    file_mentions  = body.get("file_mentions", [])
+    lint_outcome   = body.get("lint_outcome")
+    test_outcome   = body.get("test_outcome")
+    recent_msgs    = body.get("recent_messages", [])
+    skill          = request.headers.get("X-Nexus-Skill", "default")
+
+    # TODO: 1. Embed description (+ ident_mentions as boosting context)
+    # TODO: 2. Cosine similarity search against ChromaDB "overflow_cache" collection
+    #   ≥ 0.87  → CACHE HIT: return stored answer (cached=True, no LLM call)
+    #   0.65–0.87 → SIMILAR: call LLM, serve answer, skip persist (persisted=False)
+    #   < 0.65  → NOVEL: call LLM, auto-persist if confidence ≥ 0.72
+    # TODO: 3. Rank all_files by relevance (chat_files 50×, ident/file mentions 10×)
+    # TODO: 4. Build RAG context: ranked files + KB hits + skill content
+    # TODO: 5. Call LLM via Lumin8 with RAG context
+    # TODO: 6. Compute confidence: base 0.50 + length bonus + code bonus + lint/test signals
+    # TODO: 7. Apply deduplication gate at 0.80 before storing
+    # TODO: 8. Auto-persist novel+confident entries with flat 6-month TTL (no staging)
+    return {
+        "status": "ok",
+        "issue_id": "",
+        "suggestion": "",
+        "cached": False,
+        "cache_hit_similarity": None,
+        "confidence_score": None,
+        "persisted": False,
+    }
 
 
 @app.get("/v1/models")

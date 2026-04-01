@@ -263,28 +263,51 @@ All commands start with `/`. Tab-completion is available.
 
 ---
 
-## 🛠️ /solve — Error Analysis
+## 🛠️ /solve — Instant Dev Problem Solver
 
-`/solve` captures your current state and submits it to the Nexus AgentOverflow API for triage.
+`/solve` always returns an answer immediately. Internally, the backend runs a semantic cache
+decision — the developer never waits for or is aware of this. You don't need to `/add` files
+first; aider's repo-map automatically provides codebase context.
 
 ```
 > /solve the token refresh is returning 403 with valid credentials
 ```
 
-What gets sent to the backend:
+What the backend decides (transparent to the developer):
+- **Cache hit** (similarity ≥ 0.87): returns a stored answer instantly (⚡)
+- **Similar query** (0.65–0.87): calls the LLM with related context, serves answer
+- **Novel query** (< 0.65): calls LLM, if confident enough → auto-stores for the team
+
+What gets sent automatically — no `/add` needed:
 - Your description
-- Current `git diff` (uncommitted changes)
-- Files currently in chat context
+- Full codebase structure (aider repo-map file list)
+- Files you explicitly `/add`'d (higher relevance signal)
+- Identifiers and filenames mentioned in your description
+- Current `git diff`, recent commits, lint/test outcomes
 
 Example:
 ```
-> /add src/auth.py
 > /solve the refresh endpoint fails after 10 minutes but works on cold start
-✓ Overflow analysis submitted successfully.
-Suggestion: This is likely a clock skew issue between the token issuer and validator.
-            Check server NTP sync. Token TTL is 600s; if clocks differ by > 30s,
-            validation fails on re-use.
+⚡ Cache hit — returning similar solution from knowledge base.
+
+💡 This is likely a clock skew issue between the token issuer and validator.
+   Check server NTP sync. Token TTL is 600s; if clocks differ by > 30s,
+   validation fails on re-use.
 ```
+
+Or for a novel query:
+```
+> /solve consensus validator rejects blocks after epoch boundary
+🤖 Analyzed with LLM.
+   📚 Solution saved to team knowledge base.
+
+💡 The epoch boundary triggers a validator set rotation. Ensure your block
+   producer waits for the new validator set commitment before signing.
+   Resolution will be recorded automatically when you /commit.
+```
+
+Once you've fixed the issue and committed, the knowledge base is updated automatically — no
+extra steps needed. Use `/solved` only if you want to add a more detailed note.
 
 ---
 

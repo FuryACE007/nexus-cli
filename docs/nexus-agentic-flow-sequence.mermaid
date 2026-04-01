@@ -89,26 +89,32 @@ sequenceDiagram
         Note over Dev,LLM: 4️⃣  AGENTOVERFLOW — /solve (Submit Issue)
         Dev->>CLI: /solve "delegation fails<br/>after epoch transition"
 
-        CLI->>CLI: Capture context:
-        Note over CLI: git diff HEAD (unstaged)<br/>files in aider context<br/>current skill
+        CLI->>CLI: Capture rich context (automatic — no /add required):
+        Note over CLI: git_diff, dirty_files, recent_commits<br/>all_files (full codebase)<br/>chat_files (explicitly /add'd)<br/>ident_mentions, file_mentions<br/>lint_outcome, test_outcome<br/>recent_messages (last 6)
 
-        CLI->>BE: POST /api/overflow/ingest<br/>X-Nexus-Skill: staking<br/>{description, git_diff, files_in_context}
+        CLI->>BE: POST /api/overflow/ingest<br/>X-Nexus-Skill: staking<br/>{description, git_diff, all_files, chat_files,<br/>ident_mentions, file_mentions, lint_outcome, ...}
 
-        BE->>DB: INSERT overflow_issues<br/>(id=uuid, skill, description, git_diff, files,<br/>resolution=NULL, resolved_at=NULL)
+        BE->>Chroma: embed(description+ident_mentions)<br/>→ cosine similarity search
+        Chroma-->>BE: best_sim = 0.62 (below 0.87 threshold)
+
+        BE->>BE: NOVEL query (sim < 0.65)<br/>→ call LLM with RAG context
+        Note over BE: Rank all_files by relevance<br/>(chat_files 50×, mentions 10×)<br/>Inject KB hits + skill content
+
+        BE->>LLM: LLM call with ranked context
+        LLM-->>BE: "Check epoch boundary..."
+
+        BE->>BE: confidence = 0.82 ≥ 0.72<br/>→ AUTO-PERSIST (no human approval)
+
+        BE->>DB: INSERT overflow_issues<br/>(id=uuid, skill, description, suggestion,<br/>confidence=0.82, persisted=1,<br/>expires_at=now+6mo)
         DB-->>BE: inserted
 
-        BE->>Chroma: query(description, where={skill: "staking"})
-        Chroma-->>BE: [0-3 similar RESOLVED issues]
+        BE->>Chroma: upsert(id=uuid,<br/>doc="Issue: ...\nAnswer: ...",<br/>metadata={skill, expires_at})
+        Chroma-->>BE: searchable immediately
 
-        BE->>BE: Compose suggestion<br/>from top match (or generic)
-
-        BE-->>CLI: 200 {status, issue_id: "uuid-123",<br/>suggestion: "Check epoch boundary..."}
+        BE-->>CLI: 200 {status:"ok", issue_id:"uuid-123",<br/>suggestion:"Check epoch boundary...",<br/>cached:false, confidence_score:0.82, persisted:true}
 
         CLI->>CLI: Store _nexus_last_issue_id = "uuid-123"
-        CLI->>CLI: Store _nexus_last_issue_description = "delegation fails..."
-        CLI->>CLI: Store _nexus_last_solve_suggestion = "Check epoch..."
-
-        CLI-->>Dev: ✅ Submitted to AgentOverflow<br/>💡 Suggestion: "Check epoch boundary..."<br/>Resolution will auto-record on /commit
+        CLI-->>Dev: 🤖 Analyzed with LLM.<br/>📚 Solution saved to team knowledge base.<br/>💡 "Check epoch boundary..."<br/>Resolution will auto-record on /commit
     end
 
     rect rgb(230, 230, 255)

@@ -1,0 +1,47 @@
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#ffffff',
+  'primaryTextColor': '#1a1a1a',
+  'primaryBorderColor': '#555',
+  'lineColor': '#555',
+  'edgeLabelBackground': '#ffffff',
+  'fontSize': '15px'
+}}}%%
+
+flowchart TD
+
+    REPOS["📦 Product Repos"]:::input
+    CONF["📄 Confluence Pages"]:::input
+    INGEST["Ingested under\nSkill Name = Product Name"]:::process
+
+    REPOS --> INGEST
+    CONF --> INGEST
+
+    subgraph COUNCIL["  LLM Council  "]
+        direction LR
+        D["🧠 Domain Expert"]:::agent
+        A["🏗️ Architect"]:::agent
+        Q["✅ Quality Expert"]:::agent
+        S["🔄 Synthesizer"]:::agent
+        D --> S
+        A --> S
+        Q --> S
+    end
+
+    INGEST --> COUNCIL
+
+    S --> SIP["📋 Skill Improvement\nProposal  SIP"]:::doc
+    S --> GAPS["⚠️ Gap Analysis\nCode vs Docs · Code vs Standards"]:::warning
+
+    SIP --> SME{"SME Review"}:::decision
+    SME -->|"✅ Approve"| SKILL["📝 SKILL.md\nFinal skill file generated"]:::success
+    SME -->|"❌ Reject / 🔄 Request Change"| COUNCIL
+
+    classDef input      fill:#d6eaf8,stroke:#2980b9,color:#1a1a1a
+    classDef process    fill:#eaf4fb,stroke:#5dade2,color:#1a1a1a
+    classDef agent      fill:#d5f5e3,stroke:#27ae60,color:#1a1a1a,font-weight:bold
+    classDef doc        fill:#fef9e7,stroke:#f39c12,color:#1a1a1a
+    classDef warning    fill:#fdebd0,stroke:#e67e22,color:#1a1a1a
+    classDef decision   fill:#f9ebea,stroke:#e74c3c,color:#1a1a1a
+    classDef success    fill:#d4efdf,stroke:#27ae60,color:#1a1a1a,font-weight:bold
+
+    style COUNCIL fill:#eafaf1,stroke:#27ae60,stroke-width:2px,color:#1a1a1a
