@@ -346,7 +346,8 @@ The CLI expects a FastAPI server at `http://localhost:8000`. For production, cha
 | `POST` | `/v1/chat/completions` | LLM chat — OpenAI-compatible SSE streaming |
 | `GET` | `/api/skills` | List available skills (for auto-detection) |
 | `GET` | `/api/skills/{name}` | Fetch a specific skill's markdown content |
-| `POST` | `/api/overflow/ingest` | Receive error traces for analysis |
+| `POST` | `/api/overflow/ingest` | Receive `/solve` query — always returns answer immediately |
+| `POST` | `/api/overflow/resolve` | Enrich a past issue with the real committed fix |
 | `GET` | `/v1/models` | Health check (returns model list) |
 
 ### 4.2 Headers and Model Name Routing

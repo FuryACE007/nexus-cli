@@ -12,25 +12,36 @@ flowchart TD
     ISSUE["🐛 Developer hits a blocker"]:::input
 
     ISSUE --> SOLVE["/solve  describe the error"]:::cmd
-    SOLVE -->|"POST /api/overflow/ingest"| SEARCH["ChromaDB similarity search\nacross resolved fixes"]:::process
-    SEARCH -->|"match found"| HINT["💡 Past fix surfaced\ninstantly in the CLI"]:::success
-    SEARCH -->|"no match yet"| PENDING["Issue stored as pending\nin SQLite"]:::neutral
+    SOLVE -->|"POST /api/overflow/ingest"| EMBED["Embed description + ident_mentions\n→ cosine similarity search (ChromaDB)"]:::process
 
-    HINT --> FIX["Developer applies\nthe fix"]:::process
-    PENDING --> FIX
+    EMBED -->|"similarity ≥ 0.87"| CACHEHIT["⚡ CACHE HIT\nReturn stored answer instantly\ncached=true — no LLM call"]:::success
+    EMBED -->|"0.65 ≤ sim < 0.87"| SIMILAR["SIMILAR EXISTS\nCall LLM with related context\nserved but NOT persisted\n(dedup protection)"]:::neutral
+    EMBED -->|"sim < 0.65"| NOVEL["NOVEL QUERY\nCall LLM + RAG\n(ranked files, KB hits, skill content)"]:::process
 
+    NOVEL --> CONF{"confidence ≥ 0.72?"}:::decision
+    CONF -->|"yes"| AUTOPERSIST["AUTO-PERSIST\nStore in SQLite + ChromaDB\n6-month TTL (reset on each hit)\npersisted=true"]:::success
+    CONF -->|"no"| SERVEONLY["SERVE ONLY\nAnswer returned, nothing stored\npersisted=false"]:::neutral
+
+    CACHEHIT --> SHOWDEV["💡 Answer shown to developer instantly"]:::process
+    SIMILAR --> SHOWDEV
+    AUTOPERSIST --> SHOWDEV
+    SERVEONLY --> SHOWDEV
+
+    SHOWDEV --> FIX["Developer applies the fix"]:::process
     FIX --> COMMIT["/commit"]:::cmd
-    COMMIT -->|"auto-triggered\nzero developer effort"| DIFF["Capture git show HEAD diff"]:::process
-    DIFF -->|"POST /api/overflow/resolve"| LLM["Backend LLM summarizes\ndiff into readable resolution"]:::process
-    LLM --> STORE["✅ Verified fix stored\nin ChromaDB"]:::success
+
+    COMMIT -->|"auto-triggered — zero dev effort"| DIFF["Capture git show HEAD diff"]:::process
+    DIFF -->|"POST /api/overflow/resolve"| LLM["Backend LLM summarizes diff\n→ meaningful resolution text\n(replaces AI speculation)"]:::process
+    LLM --> UPGRADE["✅ Entry upgraded in ChromaDB\n(AI answer → confirmed fix)\nTTL reset to 6 months"]:::success
 
     FIX --> SOLVED["/solved  optional explicit note"]:::cmd
-    SOLVED -->|"POST /api/overflow/resolve"| STORE
+    SOLVED -->|"POST /api/overflow/resolve"| UPGRADE
 
-    STORE -->|"next developer hits same error"| HINT
+    UPGRADE -->|"next developer hits same error"| CACHEHIT
 
     classDef input    fill:#d6eaf8,stroke:#2980b9,color:#1a1a1a
     classDef cmd      fill:#f5eef8,stroke:#8e44ad,color:#1a1a1a,font-weight:bold
     classDef process  fill:#eaf4fb,stroke:#5dade2,color:#1a1a1a
     classDef success  fill:#d4efdf,stroke:#27ae60,color:#1a1a1a,font-weight:bold
     classDef neutral  fill:#f2f3f4,stroke:#999,color:#1a1a1a
+    classDef decision fill:#fef9e7,stroke:#f39c12,color:#1a1a1a

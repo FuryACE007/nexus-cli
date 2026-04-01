@@ -178,15 +178,13 @@ for chunk in completion:
 
 ## Authentication
 
-All requests include these headers:
+The CLI sends **no auth headers**. Authentication is handled entirely server-side — the backend uses its own service account / internal token. The only header the CLI sends is:
 
 | Header | Description |
 |--------|-------------|
-| `X-Internal-Auth-Token` | internal auth proxy username |
-| `X-Internal-Auth-Secret` | internal auth proxy password |
-| `X-Nexus-Skill` | Active product context name (on `/v1/chat/completions` only) |
+| `X-Nexus-Skill` | Active product context name (e.g. `"staking"`). Present on every request. |
 
-The backend should validate credentials against the internal auth proxy on each request (or use a session/token cache internally).
+The backend should validate the service-account token at startup and use it for all outbound calls to Lumin8 and Confluence.
 
 ---
 
@@ -402,25 +400,30 @@ def compute_confidence(response_text, lint_outcome, test_outcome):
 ## FastAPI Skeleton for Backend Team
 
 ```python
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-import json
+import json, uuid
+from datetime import datetime, timedelta
 
 app = FastAPI(title="Nexus Backend", version="1.0.0")
 
+# NOTE: No auth from CLI — backend authenticates via its own service account.
+# The CLI only sends X-Nexus-Skill on every request.
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
     messages = body["messages"]
     skill = request.headers.get("X-Nexus-Skill", "default")
-    username = request.headers.get("X-Internal-Auth-Token")
-    password = request.headers.get("X-Internal-Auth-Secret")
+    model = body.get("model", "nexus-agent")
 
-    # TODO: Authenticate via internal auth proxy
     # TODO: Load SKILLS.md for the active skill
     # TODO: Search Confluence for relevant chunks based on user message
+    # TODO: Search AgentOverflow KB for past fixes (search_overflow)
     # TODO: Insert RAG context as messages[1] (see integration guide)
+    # TODO: Route to correct agent via model name:
+    #   "nexus-architect" → plan, NO SEARCH/REPLACE
+    #   "nexus-agent"    → SEARCH/REPLACE blocks required
     # TODO: Forward augmented messages to LLM via Lumin8
     # TODO: Stream response back as SSE
 
@@ -462,6 +465,7 @@ async def overflow_ingest(request: Request):
     recent_msgs    = body.get("recent_messages", [])
     skill          = request.headers.get("X-Nexus-Skill", "default")
 
+    # Semantic cache decision — fully automatic, no human in the loop:
     # TODO: 1. Embed description (+ ident_mentions as boosting context)
     # TODO: 2. Cosine similarity search against ChromaDB "overflow_cache" collection
     #   ≥ 0.87  → CACHE HIT: return stored answer (cached=True, no LLM call)
@@ -472,15 +476,41 @@ async def overflow_ingest(request: Request):
     # TODO: 5. Call LLM via Lumin8 with RAG context
     # TODO: 6. Compute confidence: base 0.50 + length bonus + code bonus + lint/test signals
     # TODO: 7. Apply deduplication gate at 0.80 before storing
-    # TODO: 8. Auto-persist novel+confident entries with flat 6-month TTL (no staging)
+    # TODO: 8. Auto-persist novel+confident entries with flat 6-month TTL (no staging area)
     return {
         "status": "ok",
-        "issue_id": "",
+        "issue_id": str(uuid.uuid4()),
         "suggestion": "",
         "cached": False,
         "cache_hit_similarity": None,
         "confidence_score": None,
         "persisted": False,
+    }
+
+
+@app.post("/api/overflow/resolve")
+async def overflow_resolve(request: Request):
+    body = await request.json()
+    issue_id       = body.get("issue_id", "")
+    committed_diff = body.get("committed_diff", "")  # auto path: /commit
+    resolution     = body.get("resolution", "")       # explicit path: /solved <note>
+
+    if not issue_id:
+        raise HTTPException(status_code=422, detail="issue_id is required.")
+    if not committed_diff and not resolution:
+        raise HTTPException(status_code=422, detail="Provide committed_diff or resolution.")
+
+    # TODO: 1. Look up issue in SQLite by issue_id (404 if not found or expired)
+    # TODO: 2. If resolution present → use it directly (explicit wins over inferred)
+    # TODO: 3. If only committed_diff → call LLM to summarize:
+    #         prompt = "An engineer was debugging: {description}\n"
+    #                  "They committed: {diff}\n"
+    #                  "In 1-2 sentences, explain what the fix was."
+    # TODO: 4. UPDATE overflow_issues SET resolution=?, resolved_at=now(), expires_at=+6mo
+    # TODO: 5. overflow_collection.upsert(id, "Issue: ...\nResolution: ...", metadata)
+    return {
+        "status": "resolved",
+        "message": "Fix captured. The knowledge base will surface this for similar future issues.",
     }
 
 
